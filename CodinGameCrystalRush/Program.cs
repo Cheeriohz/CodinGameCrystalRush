@@ -191,25 +191,26 @@ public class BotOverSeer
 
         KeyValuePair<(int X, int Y), RadarAssignment> lastAssignment = this.RadarAssignments.Last();
 
-        if(lastAssignment.Key.X + RADAR_RANGE >= this.MapWidth)
+        if(lastAssignment.Key.Y + (2* RADAR_RANGE) >= this.MapHeight)
         {
-            if(lastAssignment.Key.Y + RADAR_RANGE >= this.MapHeight)
+            if(lastAssignment.Key.X + RADAR_RANGE >= this.MapWidth)
             {
                 this.Bots[entityId].OverrideBotState(BotState.IDLE);
                 this.BaseRadarNeedsMet = true;
                 return ( 1, this.Bots[entityId].Y);
             }
-
-            int tNewRowX = 1 + RADAR_RANGE / 2;
-            int tNewRowY = lastAssignment.Key.Y + RADAR_RANGE;
-            this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId= entityId };
-            return (tNewRowX, tNewRowY);
+            int tNewColumnX = lastAssignment.Key.X + (2 * RADAR_RANGE);
+            int tNewColumnY = 1 + RADAR_RANGE / 2;
+            this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId= entityId };
+            return (tNewColumnX, tNewColumnY);
+           
         }
 
-        int tNewColumnX = lastAssignment.Key.X + RADAR_RANGE;
-        int tNewColumnY = lastAssignment.Key.Y ;
-        this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId= entityId };
-        return (tNewColumnX, tNewColumnY);
+        int tNewRowX = lastAssignment.Key.X;
+        int tNewRowY = lastAssignment.Key.Y + (2 * RADAR_RANGE);
+        this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId= entityId };
+        return (tNewRowX, tNewRowY);
+        
     }
     #endregion
 
@@ -492,7 +493,7 @@ public class Bot
 
     private (BotState, BotSubState) ProcessFetchingState()
     {
-        if (this.X == this.Tx && this.Y == this.Ty)
+        if (Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) <= 1)
         {
             return (BotState.DIGGING, BotSubState.UNUSED);
         }
