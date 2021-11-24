@@ -44,10 +44,11 @@ class Player
                                             ? 0 
                                             : -1 
                                         : int.TryParse(ore, out int oreAmount) ? oreAmount : -1,
-                            HolePresent = hole == 1
+                            HolePresent = hole == 1,
+                            HasBeenIdentified = false
                         }))
                     {
-                        oreData[(j, i)].LogOreStruct(i, j);
+                        //oreData[(j, i)].LogOreStruct(i, j);
                     }
                 }
             }
@@ -68,8 +69,7 @@ class Player
                     Y = int.Parse(inputs[3]),
                     ItemType = (ItemType)int.Parse(inputs[4])
                 };
-
-                entityData.LogEntity();
+                                
                 switch (entityData.EntityType)
                 {
                     case EntityType.BOT_FRIEND:
@@ -81,6 +81,12 @@ class Player
                         {
                             bots[entityData.EntityId].ReconcileEntityData(entityData);
                         }
+                        break;
+                    case EntityType.TRAP: 
+                        //entityData.LogEntity();
+                        break;
+                    case EntityType.RADAR: 
+                        //entityData.LogEntity();
                         break;
                 }
                 roundEntities[i] = entityData;
@@ -116,6 +122,8 @@ public class BotOverSeer
     public int TrapCoolDown { get; set; }
 
     private bool BaseRadarNeedsMet { get; set; } = false;
+    private int RoundsSinceQueueRebuild { get; set; } = 0;
+
 
     public int MapHeight { get; private set;}
 
@@ -129,29 +137,48 @@ public class BotOverSeer
         this.OreData = oreData;
     }
 
+    #region Assignment
     public (int X, int Y) GetOreAssignment(int entityId)
     {
         if(OreWasIdentifiedAsPresentQueue.TryDequeue(out (int X, int Y) idLoc))
         {
-            this.OreAssignments[idLoc] = new OreAssignment { BotId = entityId };
-            return idLoc;
+            return this.ProcessOreAssignment(idLoc, entityId);
         }
 
         if(OreCouldBePresentQueue.TryDequeue(out (int X, int Y) couldLoc))
         {
-            this.OreAssignments[couldLoc] = new OreAssignment { BotId = entityId };
-            return couldLoc;
+            return this.ProcessOreAssignment(couldLoc, entityId);
         }
 
         foreach (KeyValuePair<(int X, int Y), OreStruct> oreLocation in OreData)
         {
             if (oreLocation.Value.OreCount != 0 && !this.OreAssignments.ContainsKey(oreLocation.Key))
             {
-                this.OreAssignments[oreLocation.Key] = new OreAssignment { BotId = entityId };
-                return oreLocation.Key;
+                return this.ProcessOreAssignment(oreLocation.Key, entityId);
             }
         }
         return (-1, -1);
+    }
+
+    private (int X, int Y) ProcessOreAssignment((int X, int Y) key, int entityId)
+    {
+        if(this.OreAssignments.ContainsKey(key))
+        {
+            this.OreAssignments[key] = new OreAssignment
+            {
+                LastAssignedBotId = entityId,
+                AssignmentCount = this.OreAssignments[key].AssignmentCount + 1
+            };
+        }
+        else
+        {
+            this.OreAssignments[key] = new OreAssignment
+            {
+                LastAssignedBotId = entityId,
+                AssignmentCount = 1
+            };
+        }
+        return key;
     }
 
     public (int X, int Y) GetRadarAssignment(int entityId)
@@ -164,13 +191,13 @@ public class BotOverSeer
 
         KeyValuePair<(int X, int Y), RadarAssignment> lastAssignment = this.RadarAssignments.Last();
 
-        if(lastAssignment.Key.X + RADAR_RANGE > this.MapWidth)
+        if(lastAssignment.Key.X + RADAR_RANGE >= this.MapWidth)
         {
-            if(lastAssignment.Key.Y + RADAR_RANGE > this.MapHeight)
+            if(lastAssignment.Key.Y + RADAR_RANGE >= this.MapHeight)
             {
                 this.Bots[entityId].OverrideBotState(BotState.IDLE);
                 this.BaseRadarNeedsMet = true;
-                return (-1, -1);
+                return ( 1, this.Bots[entityId].Y);
             }
 
             int tNewRowX = 1 + RADAR_RANGE / 2;
@@ -184,6 +211,7 @@ public class BotOverSeer
         this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId= entityId };
         return (tNewColumnX, tNewColumnY);
     }
+    #endregion
 
     public void ProcessOverrides()
     {
@@ -191,8 +219,15 @@ public class BotOverSeer
         {
             _ = this.HandleRadarOverride();
         }
-    }
 
+        if(this.NeedOreIdQueueRebuilt())
+        {
+            this.RebuildOreIdentifiedQueue();
+        }
+
+        this.LogQueueDiagnostics();
+        
+    }
     public bool ProcessRawOreStruct((int X, int Y) key, OreStruct oreStruct)
     {
         if(!this.OreData.ContainsKey(key))
@@ -204,27 +239,112 @@ public class BotOverSeer
 
         OreStruct currentOreStruct = this.OreData[key];
 
-        // If we have a 0 we have confirmed there is no ore. Otherwise our data is potentially out of date
-        if(currentOreStruct.OreCount != 0)
+        // If we have a 0 and the input reports -1 we have identified this spot as empty without a radar
+        if(currentOreStruct.OreCount != 0 && oreStruct.OreCount == -1)
         {
+            return false;
+        }
 
-            if(oreStruct.OreCount > 0)
+        if(oreStruct.OreCount > 0 && currentOreStruct.HasBeenIdentified == false)
+        {
+            oreStruct.HasBeenIdentified = true;
+            this.OreData[key] = oreStruct;
+
+            int outStandingOreDispatches = this.OreAssignments.TryGetValue(key, out OreAssignment storedOreAssignmentData) ? storedOreAssignmentData.AssignmentCount : 0;
+
+            for (int i = 0; i < oreStruct.OreCount - outStandingOreDispatches; i++)
             {
                 this.OreWasIdentifiedAsPresentQueue.Enqueue(key); 
             }
-            this.OreData[key] = oreStruct;
             return true;
         }
 
-        return false;
+        this.OreData[key] = oreStruct;
+        return true;        
+    }
+    private void LogQueueDiagnostics()
+    {
+        Console.Error.Write("Ore Present Queue");
+        int printCount = 0;
+        (int x, int y) priorKey = (-1, -1);
+        for (int i = 0; i < this.OreCouldBePresentQueue.Count; i++)
+        {
+            (int x, int y) orePresentLocation = this.OreCouldBePresentQueue.Dequeue();
+            if(orePresentLocation.x == priorKey.x && orePresentLocation.y == priorKey.y)
+            {
+                Console.Error.Write("+");
+            }
+            else
+            {
+                if(++printCount > 5)
+                {
+                    printCount = 0;
+                    Console.Error.WriteLine($"(   {orePresentLocation.x}, {orePresentLocation.y})");
+                }
+                else
+                {
+                    Console.Error.Write($"| ({orePresentLocation.x}, {orePresentLocation.y})");
+                }
+            }
+            priorKey = orePresentLocation;
+            this.OreCouldBePresentQueue.Enqueue(orePresentLocation);
+        }
+        Console.Error.WriteLine();
 
-        
+        printCount = 0;
+        priorKey = (-1, -1);
+        Console.Error.Write("Ore Identified Queue | ");
+        for (int i = 0; i < this.OreWasIdentifiedAsPresentQueue.Count; i++)
+        {
+            (int x, int y) oreIdentifiedLocation = this.OreWasIdentifiedAsPresentQueue.Dequeue();
+            if(oreIdentifiedLocation.x == priorKey.x && oreIdentifiedLocation.y == priorKey.y)
+            {
+                Console.Error.Write("+");
+            }
+            else
+            {
+                if(++printCount > 5)
+                {
+                    printCount = 0;
+                    Console.Error.WriteLine($"(   {oreIdentifiedLocation.x}, {oreIdentifiedLocation.y})");
+                }
+                else
+                {
+                    Console.Error.Write($"| ({oreIdentifiedLocation.x}, {oreIdentifiedLocation.y})");
+                }
+            }
+            priorKey = oreIdentifiedLocation;
+            this.OreWasIdentifiedAsPresentQueue.Enqueue(oreIdentifiedLocation);
+        }
+        Console.Error.WriteLine();
+    }
+    
+    private bool NeedOreIdQueueRebuilt() => ++this.RoundsSinceQueueRebuild > 10;
+    private void RebuildOreIdentifiedQueue()
+    {
+        this.RoundsSinceQueueRebuild = 0;
+        this.OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>();
+
+        foreach(KeyValuePair<(int X, int Y), OreStruct> kvp in this.OreData.OrderBy(kvp => kvp.Key.X))
+        {
+            int potentialOreAssignment = kvp.Value.OreCount - (this.OreAssignments.TryGetValue(kvp.Key, out OreAssignment storedOreAssignmentData) ? storedOreAssignmentData.AssignmentCount : 0);
+            if(potentialOreAssignment > 0)
+            {
+                for (int i = 0; i < potentialOreAssignment; i++)
+                {
+                    OreWasIdentifiedAsPresentQueue.Enqueue(kvp.Key);
+                }
+            }
+            if(OreWasIdentifiedAsPresentQueue.Count > 20)
+            {
+                return;
+            }
+        }
     }
     private bool NeedRadarOverride()
     {
         return this.RadarCoolDown < 1 && !this.BaseRadarNeedsMet;
     }
-
     private bool HandleRadarOverride()
     {
         // First pass check for bots that are not fetching
@@ -234,6 +354,24 @@ public class BotOverSeer
             {
                 return true;
             }
+        }
+
+        int closestBot = -1;
+        int closestBotDistanceToHq = int.MaxValue;
+
+        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP))
+        {
+            int currentBotDistanceToHq = bot.X;
+            if(currentBotDistanceToHq < closestBotDistanceToHq)
+            {
+                closestBot = bot.EntityId;
+                closestBotDistanceToHq = currentBotDistanceToHq;
+            }
+        }
+
+        if(closestBot != -1 && this.Bots[closestBot].OverrideBotState(BotState.RADAR_RETRIEVE))
+        {
+            return true;
         }
         
         return false;
@@ -254,10 +392,21 @@ public class BotOverSeer
     
     public void HandleDispatchReportOre(int x, int y, OreStruct oreReport, OreDispatchReport dispatchReport)
     {
-        this.OreData[(x, y)] = oreReport;
-        if(dispatchReport == OreDispatchReport.ORE_FOUND)
+        if(this.OreData[(x, y)].HasBeenIdentified)
         {
-            OreCouldBePresentQueue.Enqueue((x, y));
+            // We don't do anything, because identified ore comes from radars and data will be accurately maintained without blind management.
+        }
+        else
+        {
+            this.OreData[(x, y)] = oreReport;
+            if(dispatchReport == OreDispatchReport.ORE_FOUND)
+            {
+                OreStruct currentOreData = this.OreData[(x, y)];
+                if(currentOreData.OreCount == -1)
+                {
+                    OreCouldBePresentQueue.Enqueue((x, y));
+                }
+            }
         }
     }
 
@@ -356,7 +505,7 @@ public class Bot
         {
             if(this.ItemType == ItemType.ORE)
             {
-                this.OverSeer.HandleDispatchReportOre(this.Tx, this.Ty, new OreStruct { HolePresent = true, OreCount = 0 }, OreDispatchReport.ORE_FOUND);
+                this.OverSeer.HandleDispatchReportOre(this.Tx, this.Ty, new OreStruct { HolePresent = true, OreCount = -1 }, OreDispatchReport.ORE_FOUND);
             }
             return (BotState.DEPOSITING, BotSubState.UNUSED);
         }
@@ -437,12 +586,16 @@ public class Bot
             this.BuildWait();
         }
 
-        return this.BuildMove(0, this.X);
+        return this.BuildMove(0, this.Y);
     }
     public string ProcessRadarRetrieveOutput()
     {
         if(this.X == 0)
         {
+            if(this.ItemType == ItemType.ORE)
+            {
+                this.BuildWait();
+            }
             return this.BuildRequest(ItemType.RADAR);
         }
 
@@ -494,6 +647,7 @@ public struct OreStruct
 {
     public int OreCount;
     public bool HolePresent;
+    public bool HasBeenIdentified;
 
     public void LogOreStruct(int x, int y)
     {
@@ -506,7 +660,8 @@ public struct OreStruct
 
 public struct OreAssignment
 {
-    public int BotId;
+    public int LastAssignedBotId;
+    public int AssignmentCount;
 }
 
 public struct RadarAssignment
