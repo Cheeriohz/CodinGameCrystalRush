@@ -115,6 +115,8 @@ public class BotOverSeer
     public int RadarCoolDown { get; set; }
     public int TrapCoolDown { get; set; }
 
+    private bool BaseRadarNeedsMet { get; set; } = false;
+
     public int MapHeight { get; private set;}
 
     public int MapWidth { get; private set;}
@@ -164,6 +166,13 @@ public class BotOverSeer
 
         if(lastAssignment.Key.X + RADAR_RANGE > this.MapWidth)
         {
+            if(lastAssignment.Key.Y + RADAR_RANGE > this.MapHeight)
+            {
+                this.Bots[entityId].OverrideBotState(BotState.IDLE);
+                this.BaseRadarNeedsMet = true;
+                return (-1, -1);
+            }
+
             int tNewRowX = 1 + RADAR_RANGE / 2;
             int tNewRowY = lastAssignment.Key.Y + RADAR_RANGE;
             this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId= entityId };
@@ -213,7 +222,7 @@ public class BotOverSeer
     }
     private bool NeedRadarOverride()
     {
-        return this.RadarCoolDown < 1;
+        return this.RadarCoolDown < 1 && !this.BaseRadarNeedsMet;
     }
 
     private bool HandleRadarOverride()
