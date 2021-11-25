@@ -115,8 +115,12 @@ public class BotOverSeer
 
     private Queue<(int X, int Y)> OreCouldBePresentQueue = new Queue<(int X, int Y)>();
     private Queue<(int X, int Y)> OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>();
+    
     public Dictionary<(int X, int Y), OreAssignment> OreAssignments { get; private set; } = new Dictionary<(int, int), OreAssignment>();
     public Dictionary<(int X, int Y), RadarAssignment> RadarAssignments { get; private set; } = new Dictionary<(int, int), RadarAssignment>();
+    public Dictionary<(int X, int Y), bool> EnemyTrapRecords { get; private set;} = new Dictionary<(int, int), bool>();
+
+    private Dictionary<int, EntityData> EnemyTrackingData { get; set; } = new Dictionary<int, EntityData>();
 
     public int RadarCoolDown { get; set; }
     public int TrapCoolDown { get; set; }
@@ -142,17 +146,23 @@ public class BotOverSeer
     {
         if(OreWasIdentifiedAsPresentQueue.TryDequeue(out (int X, int Y) idLoc))
         {
-            return this.ProcessOreAssignment(idLoc, entityId);
+            return this.EnemyTrapRecords.ContainsKey(idLoc) 
+                ? this.GetOreAssignment(entityId) 
+                : this.ProcessOreAssignment(idLoc, entityId);
         }
 
-        if(OreCouldBePresentQueue.TryDequeue(out (int X, int Y) couldLoc))
+        if (OreCouldBePresentQueue.TryDequeue(out (int X, int Y) couldLoc))
         {
-            return this.ProcessOreAssignment(couldLoc, entityId);
+            return this.EnemyTrapRecords.ContainsKey(couldLoc)
+                ? this.GetOreAssignment(entityId)
+                : this.ProcessOreAssignment(couldLoc, entityId); 
         }
 
         foreach (KeyValuePair<(int X, int Y), OreStruct> oreLocation in OreData)
         {
-            if (oreLocation.Value.OreCount != 0 && !this.OreAssignments.ContainsKey(oreLocation.Key))
+            if (oreLocation.Value.OreCount != 0 
+            && !this.OreAssignments.ContainsKey(oreLocation.Key) 
+            && !this.EnemyTrapRecords.ContainsKey(oreLocation.Key))
             {
                 return this.ProcessOreAssignment(oreLocation.Key, entityId);
             }
@@ -164,9 +174,15 @@ public class BotOverSeer
     {
         if(this.OreAssignments.ContainsKey(key))
         {
+            HashSet<int> addedEntities = this.OreAssignments[key].AssignedBots;
+            // if(!addedEntities.ContainsKey(entityId))
+            // {
+                addedEntities.Add(entityId);
+            // }
+            
             this.OreAssignments[key] = new OreAssignment
             {
-                LastAssignedBotId = entityId,
+                AssignedBots = addedEntities,
                 AssignmentCount = this.OreAssignments[key].AssignmentCount + 1
             };
         }
@@ -174,9 +190,10 @@ public class BotOverSeer
         {
             this.OreAssignments[key] = new OreAssignment
             {
-                LastAssignedBotId = entityId,
+                AssignedBots = new HashSet<int>() { entityId } ,
                 AssignmentCount = 1
             };
+            
         }
         return key;
     }
@@ -226,7 +243,7 @@ public class BotOverSeer
             this.RebuildOreIdentifiedQueue();
         }
 
-        this.LogQueueDiagnostics();
+        this.LogDiagnostics();
         
     }
     public bool ProcessRawOreStruct((int X, int Y) key, OreStruct oreStruct)
@@ -263,10 +280,84 @@ public class BotOverSeer
         this.OreData[key] = oreStruct;
         return true;        
     }
-    private void LogQueueDiagnostics()
+
+    // Processes Raw Enemy Feed from the underlying native reporting system. If the enemy is of note returns true
+    private bool ProcessRawEnemyData(EntityData entity)
     {
-        Console.Error.Write("Ore Present Queue");
+        //Check if the enemy dropped a trap.
+        if(this.EnemyTrackingData[entity.EntityId].ItemType == ItemType.TRAP && entity.ItemType != ItemType.TRAP)
+        {
+            this.ProcessTrapPlantEvent(this.EnemyTrackingData[entity.EntityId]); 
+            this.EnemyTrackingData[entity.EntityId] = entity;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void ProcessTrapPlantEvent(EntityData entityDataAtTimeOfTrapDrop)
+    {
+        // Because we can't identify where the trap was placed, we have to flag all adjacent areas.
+        (int X, int Y) key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y);
+        this.EnemyTrapRecords[key] 
+            = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
+        this.CancelOreAssignmentForLocation(key);
+
+        key = (entityDataAtTimeOfTrapDrop.X + 1, entityDataAtTimeOfTrapDrop.Y);
+        this.EnemyTrapRecords[key] 
+            = this.EnemyTrapRecords.TryGetValue(key, out currentValue) && currentValue;
+        this.CancelOreAssignmentForLocation(key);
+
+        key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y + 1);
+        this.EnemyTrapRecords[key] 
+            = this.EnemyTrapRecords.TryGetValue(key, out currentValue) && currentValue;
+        this.CancelOreAssignmentForLocation(key);
+
+        key = (entityDataAtTimeOfTrapDrop.X - 1, entityDataAtTimeOfTrapDrop.Y);
+        this.EnemyTrapRecords[key] 
+            = this.EnemyTrapRecords.TryGetValue(key, out currentValue) && currentValue;
+        this.CancelOreAssignmentForLocation(key);
+
+        key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y - 1);
+        this.EnemyTrapRecords[key] 
+            = this.EnemyTrapRecords.TryGetValue(key, out currentValue) && currentValue;            
+        this.CancelOreAssignmentForLocation(key);
+    }
+
+    private void CancelOreAssignmentForLocation((int X, int Y) key)
+    {
+        if(this.OreAssignments.TryGetValue(key, out OreAssignment oreAssignment))
+        {
+            foreach( int botId in oreAssignment.AssignedBots)
+            {
+                Bot botToPotentiallyRecall = this.Bots[botId];
+                if(botToPotentiallyRecall.Tx == key.X && botToPotentiallyRecall.Ty == key.Y)
+                {
+                    botToPotentiallyRecall.OverrideBotState(BotState.IDLE);
+                }
+            }
+        }
+    }
+
+    private void LogDiagnostics()
+    {
+        Console.Error.Write("Trap Records");
         int printCount = 0;
+        foreach((int X, int Y) key in this.EnemyTrapRecords.Keys)
+        {
+            if(++printCount > 5)
+            {
+                printCount = 0;
+                Console.Error.WriteLine($"(   {key.X}, {key.Y})");
+            }
+            else
+            {
+                Console.Error.Write($"| ({key.X}, {key.Y})");
+            }
+        }
+
+        Console.Error.Write("Ore Present Queue");
+        printCount = 0;
         (int x, int y) priorKey = (-1, -1);
         for (int i = 0; i < this.OreCouldBePresentQueue.Count; i++)
         {
@@ -344,7 +435,7 @@ public class BotOverSeer
     }
     private bool NeedRadarOverride()
     {
-        return this.RadarCoolDown < 1 && !this.BaseRadarNeedsMet;
+        return this.RadarCoolDown < 1 && !this.Bots.Values.Any(bot => bot.State == BotState.RADAR_RETRIEVE) && !this.BaseRadarNeedsMet;
     }
     private bool HandleRadarOverride()
     {
@@ -360,7 +451,7 @@ public class BotOverSeer
         int closestBot = -1;
         int closestBotDistanceToHq = int.MaxValue;
 
-        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP))
+        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR))
         {
             int currentBotDistanceToHq = bot.X;
             if(currentBotDistanceToHq < closestBotDistanceToHq)
@@ -457,6 +548,8 @@ public class Bot
         {
             BotState.DIGGING => true,
             BotState.DEPOSITING => true,
+            BotState.RADAR_RETRIEVE => true,
+            BotState.RADAR_PLANT => true,
             _ => false
         };  
     }
@@ -661,7 +754,7 @@ public struct OreStruct
 
 public struct OreAssignment
 {
-    public int LastAssignedBotId;
+    public HashSet<int> AssignedBots;
     public int AssignmentCount;
 }
 
@@ -683,6 +776,13 @@ public struct EntityData
         Console.Error.WriteLine($"EntityId: {this.EntityId} | EntityType: {this.EntityType.ToString("G")} | ({this.X}, {this.Y}) | {this.ItemType.ToString("G")}");
     }
 
+}
+
+public ref struct TrapSurveilanceReport
+{
+    public int EntityId;
+    public int X;
+    public int Y;
 }
 
 public enum BotState
