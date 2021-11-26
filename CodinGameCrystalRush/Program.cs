@@ -82,8 +82,14 @@ class Player
                             bots[entityData.EntityId].ReconcileEntityData(entityData);
                         }
                         break;
+                    case EntityType.BOT_ENEMY:
+                        if(overSeer.ProcessRawEnemyData(entityData))
+                        {
+                            entityData.LogEntity();
+                        }
+                        break;
                     case EntityType.TRAP: 
-                        //entityData.LogEntity();
+                        entityData.LogEntity();
                         break;
                     case EntityType.RADAR: 
                         //entityData.LogEntity();
@@ -91,8 +97,7 @@ class Player
                 }
                 roundEntities[i] = entityData;
             }
-
-            overSeer.ProcessOverrides();
+            overSeer.ProcessOverrides(roundEntities);
 
             foreach (Bot bot in bots.Values)
             {
@@ -120,12 +125,13 @@ public class BotOverSeer
     public Dictionary<(int X, int Y), RadarAssignment> RadarAssignments { get; private set; } = new Dictionary<(int, int), RadarAssignment>();
     public Dictionary<(int X, int Y), bool> EnemyTrapRecords { get; private set;} = new Dictionary<(int, int), bool>();
 
-    private Dictionary<int, EntityData> EnemyTrackingData { get; set; } = new Dictionary<int, EntityData>();
+    private Dictionary<int, EntityEnemyData> EnemyTrackingData { get; set; } = new Dictionary<int, EntityEnemyData>();
 
     public int RadarCoolDown { get; set; }
     public int TrapCoolDown { get; set; }
 
     private bool BaseRadarNeedsMet { get; set; } = false;
+    private bool OffsetRadar { get; set; } = false;
     private int RoundsSinceQueueRebuild { get; set; } = 0;
 
 
@@ -202,6 +208,7 @@ public class BotOverSeer
     {
         if(this.RadarAssignments.Count == 0)
         {
+            this.OffsetRadar = true;
             this.RadarAssignments[( 1 + RADAR_RANGE / 2, 1 + RADAR_RANGE / 2)] = new RadarAssignment { BotId = entityId };
             return ( 1 + RADAR_RANGE / 2, 1 + RADAR_RANGE / 2);
         }
@@ -216,7 +223,17 @@ public class BotOverSeer
                 this.BaseRadarNeedsMet = true;
                 return ( 1, this.Bots[entityId].Y);
             }
-            int tNewColumnX = lastAssignment.Key.X + (2 * RADAR_RANGE);
+
+            if(this.OffsetRadar)
+            {
+                this.OffsetRadar = false;
+                int tNewColumnXOffset = lastAssignment.Key.X + RADAR_RANGE;
+                int tNewColumnYOffset = (1 + RADAR_RANGE / 2) + RADAR_RANGE;
+                this.RadarAssignments[(tNewColumnXOffset, tNewColumnYOffset)] = new RadarAssignment { BotId= entityId };
+                return (tNewColumnXOffset, tNewColumnYOffset);    
+            }
+            this.OffsetRadar = true;
+            int tNewColumnX = lastAssignment.Key.X + RADAR_RANGE;
             int tNewColumnY = 1 + RADAR_RANGE / 2;
             this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId= entityId };
             return (tNewColumnX, tNewColumnY);
@@ -231,8 +248,10 @@ public class BotOverSeer
     }
     #endregion
 
-    public void ProcessOverrides()
+    public void ProcessOverrides(EntityData[] entities)
     {
+        this.ProcessFriendlyBotDeath(entities);
+
         if(this.NeedRadarOverride())
         {
             _ = this.HandleRadarOverride();
@@ -282,16 +301,38 @@ public class BotOverSeer
     }
 
     // Processes Raw Enemy Feed from the underlying native reporting system. If the enemy is of note returns true
-    private bool ProcessRawEnemyData(EntityData entity)
+    public bool ProcessRawEnemyData(EntityData entity)
     {
-        //Check if the enemy dropped a trap.
-        if(this.EnemyTrackingData[entity.EntityId].ItemType == ItemType.TRAP && entity.ItemType != ItemType.TRAP)
+        if(!this.EnemyTrackingData.ContainsKey(entity.EntityId))
         {
-            this.ProcessTrapPlantEvent(this.EnemyTrackingData[entity.EntityId]); 
-            this.EnemyTrackingData[entity.EntityId] = entity;
+            this.EnemyTrackingData[entity.EntityId] = new EntityEnemyData(entity) { WaitCount = 0, ItemSuspect = ItemType.NONE };
             return true;
         }
 
+        EntityEnemyData priorEnemyData = this.EnemyTrackingData[entity.EntityId];
+        EntityEnemyData newEnemyData = new EntityEnemyData(entity) { WaitCount = priorEnemyData.WaitCount, ItemSuspect = ItemType.NONE };
+
+        if(priorEnemyData.X == newEnemyData.X && priorEnemyData.Y == newEnemyData.Y)
+        {
+            if(++newEnemyData.WaitCount > 1 && newEnemyData.X == 0)
+            {
+                // Enemy requested an item.
+                Console.Error.WriteLine($"Enemy at ({newEnemyData.X},{newEnemyData.Y} suspected of carrying trap)");
+                newEnemyData.ItemSuspect = ItemType.TRAP;
+                this.EnemyTrackingData[entity.EntityId] = newEnemyData;
+                return true;
+            }
+            else if(newEnemyData.X != 0 && newEnemyData.ItemSuspect == ItemType.TRAP) 
+            {
+                newEnemyData.ItemSuspect = ItemType.NONE;
+                this.ProcessTrapPlantEvent(newEnemyData);
+                this.EnemyTrackingData[entity.EntityId] = newEnemyData;
+                return true;    
+            }
+
+        }
+
+        this.EnemyTrackingData[entity.EntityId] = newEnemyData;
         return false;
     }
 
@@ -322,6 +363,43 @@ public class BotOverSeer
         this.EnemyTrapRecords[key] 
             = this.EnemyTrapRecords.TryGetValue(key, out currentValue) && currentValue;            
         this.CancelOreAssignmentForLocation(key);
+
+
+        foreach(Bot bot in this.Bots.Values)
+        {
+            if(Utility.GetOrthoDistance(bot.X, bot.Y, entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y) <= 2)
+            {
+                bot.OverrideBotState(BotState.SCATTER);
+                bot.Tx = entityDataAtTimeOfTrapDrop.X > bot.X 
+                    ? Math.Max(0, bot.X - 2)
+                    : Math.Min(this.MapWidth, bot.X + 2);
+
+                bot.Ty = entityDataAtTimeOfTrapDrop.Y > bot.Y 
+                    ? Math.Max(0, bot.Y - 2)
+                    : Math.Min(this.MapHeight, bot.Y + 2);    
+            }
+        }
+
+    }
+
+    private void ProcessFriendlyBotDeath(EntityData[] entities)
+    {
+        Dictionary<int, bool> aliveBots = new Dictionary<int, bool>();
+        foreach(EntityData entity in entities)
+        {
+            if(entity.EntityType == EntityType.BOT_FRIEND)
+            {
+                aliveBots[entity.EntityId] = true;
+            }
+        }
+
+        foreach(Bot bot in this.Bots.Values)
+        {
+            if(!aliveBots.ContainsKey(bot.EntityId))
+            {
+                bot.OverrideBotState(BotState.DEAD);
+            }
+        }
     }
 
     private void CancelOreAssignmentForLocation((int X, int Y) key)
@@ -355,6 +433,7 @@ public class BotOverSeer
                 Console.Error.Write($"| ({key.X}, {key.Y})");
             }
         }
+        Console.Error.WriteLine();
 
         Console.Error.Write("Ore Present Queue");
         printCount = 0;
@@ -451,7 +530,7 @@ public class BotOverSeer
         int closestBot = -1;
         int closestBotDistanceToHq = int.MaxValue;
 
-        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR))
+        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR && bot.State != BotState.DEAD))
         {
             int currentBotDistanceToHq = bot.X;
             if(currentBotDistanceToHq < closestBotDistanceToHq)
@@ -550,6 +629,7 @@ public class Bot
             BotState.DEPOSITING => true,
             BotState.RADAR_RETRIEVE => true,
             BotState.RADAR_PLANT => true,
+            BotState.DEAD => true,
             _ => false
         };  
     }
@@ -573,12 +653,24 @@ public class Bot
             BotState.DEPOSITING => this.ProcessDepositingState(),
             BotState.RADAR_RETRIEVE => this.ProcessRadarRetrieveState(),
             BotState.RADAR_PLANT => this.ProcessRadarPlantState(),
+            BotState.SCATTER => this.ProcessScatterState(),
+            BotState.DEAD => (BotState.DEAD, BotSubState.UNUSED),
             _ => this.ProcessIdleState()
         };
     }
 
     private (BotState, BotSubState) ProcessIdleState()
     {
+        if(this.ItemType == ItemType.RADAR)
+        {
+            return (BotState.RADAR_PLANT, BotSubState.UNUSED);
+        }
+
+        if(this.ItemType == ItemType.ORE)
+        {
+            return (BotState.DEPOSITING, BotSubState.UNUSED);
+        }
+
         (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId);
         this.SubState = BotSubState.UNUSED;
         return (BotState.FETCHING, BotSubState.UNUSED);
@@ -643,6 +735,15 @@ public class Bot
         return this.ProcessIdleState();
     }
        
+    private (BotState, BotSubState) ProcessScatterState()
+    {
+        if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) < 1)
+        {
+            return this.ProcessIdleState();
+        }
+
+        return (BotState.SCATTER, BotSubState.UNUSED);
+    }
 
     #endregion
 
@@ -657,6 +758,7 @@ public class Bot
             BotState.DEPOSITING => this.ProcessDepositingOutput(),
             BotState.RADAR_RETRIEVE => this.ProcessRadarRetrieveOutput(),
             BotState.RADAR_PLANT => this.ProcessRadarPlantOutput(),
+            BotState.DEAD => this.BuildWait(),
             _ => this.ProcessIdleOutput()
         };
     }
@@ -705,6 +807,10 @@ public class Bot
         return this.BuildMove(this.Tx, this.Ty);
     }
 
+    public string ProcessScatterOutput()
+    {
+        return this.BuildMove(this.Tx, this.Ty);
+    }
     #endregion
 }
 
@@ -778,6 +884,30 @@ public struct EntityData
 
 }
 
+public struct EntityEnemyData
+{
+    public EntityEnemyData(EntityData rawEntityData)
+    {
+        this.EntityId = rawEntityData.EntityId;
+        this.EntityType = EntityType.BOT_ENEMY;
+        this.X = rawEntityData.X;
+        this.Y = rawEntityData.Y;
+    }
+
+    public int EntityId;
+    public EntityType EntityType;
+    public int X;
+    public int Y;
+    public ItemType ItemSuspect;
+    public int WaitCount;
+
+    public void LogEnemyEntity() 
+    {
+        Console.Error.WriteLine($"EntityId: {this.EntityId} | WaitCount: {this.WaitCount} | ({this.X}, {this.Y}) | ItemSuspect {this.ItemSuspect.ToString("G")}");
+    }
+
+}
+
 public ref struct TrapSurveilanceReport
 {
     public int EntityId;
@@ -792,7 +922,9 @@ public enum BotState
     DIGGING,
     DEPOSITING,
     RADAR_RETRIEVE,
-    RADAR_PLANT
+    RADAR_PLANT,
+    SCATTER,
+    DEAD
 }
 
 public enum BotSubState
