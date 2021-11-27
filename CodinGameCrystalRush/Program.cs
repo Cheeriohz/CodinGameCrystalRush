@@ -463,6 +463,7 @@ public class BotOverSeer
         if(identifiedDigLocations.Count == 1) 
         {
             (int X, int Y) specificKey = (identifiedDigLocations[0].X, identifiedDigLocations[0].Y);
+            this.EnemyTrapRecords[specificKey] = true;
             this.CancelOreAssignmentForLocation(specificKey, 1);
             this.ScatterBotsAtLocation((specificKey.X, specificKey.Y), 1);
             this.RebuildOreIdentifiedQueue();
@@ -538,17 +539,9 @@ public class BotOverSeer
         Dictionary<int, bool> aliveBots = new Dictionary<int, bool>();
         foreach(EntityData entity in entities)
         {
-            if(entity.EntityType == EntityType.BOT_FRIEND)
+            if(entity.X == -1 && entity.Y == -1)
             {
-                aliveBots[entity.EntityId] = true;
-            }
-        }
-
-        foreach(Bot bot in this.Bots.Values)
-        {
-            if(!aliveBots.ContainsKey(bot.EntityId))
-            {
-                bot.OverrideBotState(BotState.DEAD);
+                _ = this.Bots.TryGetValue(entity.EntityId, out Bot bot) && bot.OverrideBotState(BotState.DEAD);
             }
         }
     }
