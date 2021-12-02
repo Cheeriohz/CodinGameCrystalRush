@@ -89,7 +89,7 @@ class Player
                         }
                         break;
                     case EntityType.TRAP: 
-                        entityData.LogEntity();
+                        //entityData.LogEntity();
                         break;
                     case EntityType.RADAR: 
                         //entityData.LogEntity();
@@ -97,7 +97,7 @@ class Player
                 }
                 roundEntities[i] = entityData;
             }
-            overSeer.ProcessOverrides(roundEntities);
+            overSeer.ProcessDuty(roundEntities);
 
             foreach (Bot bot in bots.Values)
             {
@@ -120,6 +120,8 @@ public class BotOverSeer
 
     private Queue<(int X, int Y)> OreCouldBePresentQueue = new Queue<(int X, int Y)>();
     private Queue<(int X, int Y)> OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>();
+    private Queue<(int X, int Y)> PossibleEnemyRadarQueue = new Queue<(int X, int Y)>();
+    private Queue<EntityEnemyData> TrapEventsToProcess = new Queue<EntityEnemyData>();
     
     public Dictionary<(int X, int Y), OreAssignment> OreAssignments { get; private set; } = new Dictionary<(int, int), OreAssignment>();
     public Dictionary<(int X, int Y), RadarAssignment> RadarAssignments { get; private set; } = new Dictionary<(int, int), RadarAssignment>();
@@ -129,6 +131,7 @@ public class BotOverSeer
     private Dictionary<int, EntityEnemyData> EnemyTrackingData { get; set; } = new Dictionary<int, EntityEnemyData>();
 
     private List<(int X, int Y)> OreDugPriorRound { get; set; } = new List<(int, int)>();
+    private List<(int X, int Y)> HolesMadePriorRound { get; set; } = new List<(int, int)>();
 
     public int RadarCoolDown { get; set; }
     public int TrapCoolDown { get; set; }
@@ -138,7 +141,8 @@ public class BotOverSeer
     private bool OffsetRadar { get; set; } = false;
     private int RoundsSinceQueueRebuild { get; set; } = 0;
 
-
+    private int EnemyXMax { get; set; } = 10;
+    private int? EnemyXMaxId { get; set; } = null;
     public int MapHeight { get; private set;}
 
     public int MapWidth { get; private set;}
@@ -164,7 +168,7 @@ public class BotOverSeer
         
         // use a false flag to indicate an unconfirmed trap to prevent further assignment to the vein.
         this.EnemyTrapRecords[key] = false;
-        this.CancelOreAssignmentForLocation(key);
+        this.CancelDigAssignmentForLocation(key);
 
         this.TrapAssignments[key] = new TrapAssignment { BotId = entityId };
         this.TrapCoolDown = 100;
@@ -190,14 +194,29 @@ public class BotOverSeer
 
         foreach (KeyValuePair<(int X, int Y), OreStruct> oreLocation in OreData)
         {
-            if (oreLocation.Value.OreCount != 0 
+            if (oreLocation.Value.OreCount != 0 && oreLocation.Value.OreCount == -2 
             && !this.OreAssignments.ContainsKey(oreLocation.Key) 
             && !this.EnemyTrapRecords.ContainsKey(oreLocation.Key))
             {
                 return this.ProcessOreAssignment(oreLocation.Key, entityId);
             }
         }
-        return (-1, -1);
+
+        foreach (KeyValuePair<(int X, int Y), OreStruct> oreLocation in OreData)
+        {
+            if (oreLocation.Value.OreCount == -1 && oreLocation.Value.OreCount == -2 
+            && !this.OreAssignments.ContainsKey(oreLocation.Key) 
+            && !this.EnemyTrapRecords.ContainsKey(oreLocation.Key))
+            {
+                return this.ProcessOreAssignment(oreLocation.Key, entityId);
+            }
+        }
+        return (0, 5);
+    }
+
+    public (int X, int Y) GetRadarSabotageAssignment(int _)
+    {
+       return PossibleEnemyRadarQueue.TryDequeue(out (int X, int Y) radLoc) ? radLoc : default;
     }
 
     private (int X, int Y) ProcessOreAssignment((int X, int Y) key, int entityId)
@@ -274,21 +293,28 @@ public class BotOverSeer
     }
     #endregion
 
-    public void ProcessOverrides(EntityData[] entities)
+    public void ProcessDuty(EntityData[] entities)
     {
         this.ProcessFriendlyBotDeath(entities);
-
-        if(this.NeedRadarOverride())
+        while(this.TrapEventsToProcess.Count > 0)
         {
-            _ = this.HandleRadarOverride();
+            EntityEnemyData newEnemyData = this.TrapEventsToProcess.Dequeue();
+            this.ProcessTrapPlantEvent(newEnemyData);
         }
 
-        if(this.NeedOreIdQueueRebuilt())
+        bool friendRadarOverrideUsed = this.NeedRadarOverride() && this.HandleRadarOverride();
+        bool enemyRadarOverrideUsed = this.NeedEnemyRadarOverride() && this.HandleEnemyRadarOverride();
+        bool oreQueueRebuildUsed = this.NeedOreIdQueueRebuilt() && this.RebuildOreIdentifiedQueue();
+        bool sackModeUsed = this.ShouldSackABot();
+
+        if(friendRadarOverrideUsed || enemyRadarOverrideUsed ||  oreQueueRebuildUsed)
         {
-            this.RebuildOreIdentifiedQueue();
+            Console.Error.WriteLine($"{(friendRadarOverrideUsed ? "Friendly Radar Override Engaged" : string.Empty)} {(enemyRadarOverrideUsed ? "Enemy Radar Override Engaged" : string.Empty)} ");
+            Console.Error.WriteLine($"{(oreQueueRebuildUsed ? "Ore Queue Rebuild Override Engaged" : string.Empty)} {(sackModeUsed ? "Sack Mode Engaged" : string.Empty)}");
         }
 
         this.LogDiagnostics();
+        this.ClearSingleRoundData();
         
     }
     public bool ProcessRawOreStruct((int X, int Y) key, OreStruct oreStruct)
@@ -312,6 +338,11 @@ public class BotOverSeer
         if(currentOreStruct.OreCount != 0 && oreStruct.OreCount == -1)
         {
             return false;
+        }
+
+        if(currentOreStruct.HolePresent != oreStruct.HolePresent)
+        {
+            this.HolesMadePriorRound.Add(key);
         }
 
         if(oreStruct.OreCount > 0 && currentOreStruct.HasBeenIdentified == false)
@@ -349,6 +380,12 @@ public class BotOverSeer
             return true;
         }
 
+        if(entity.X > this.EnemyXMax)
+        {
+            this.EnemyXMax = entity.X;
+            this.EnemyXMaxId = entity.EntityId;
+        }
+
         EntityEnemyData priorEnemyData = this.EnemyTrackingData[entity.EntityId];
         EntityEnemyData newEnemyData = new EntityEnemyData(entity, priorEnemyData.ItemSuspect, priorEnemyData.WaitCount);
 
@@ -362,12 +399,20 @@ public class BotOverSeer
                 this.EnemyTrackingData[entity.EntityId] = newEnemyData;
                 return true;
             }
-            else if(newEnemyData.X != 0 && newEnemyData.ItemSuspect == ItemType.TRAP) 
+            else if(newEnemyData.X != 0 && newEnemyData.ItemSuspect == ItemType.TRAP)
             {
                 newEnemyData.ItemSuspect = ItemType.NONE;
-                this.ProcessTrapPlantEvent(newEnemyData);
-                this.EnemyTrackingData[entity.EntityId] = newEnemyData;
-                return true;    
+                if(entity.EntityId == (this.EnemyXMaxId ?? -1))
+                {
+                    this.EnemyXMaxId = null;
+                    this.ProcessLikelyEnemyRadarPlant((entity.X, entity.Y));
+                }
+                else
+                {
+                    this.TrapEventsToProcess.Enqueue(newEnemyData);
+                    this.EnemyTrackingData[entity.EntityId] = newEnemyData;
+                    return true;    
+                }
             }
             else if(newEnemyData.X != 0 && newEnemyData.ItemSuspect == ItemType.NONE)
             {
@@ -382,6 +427,39 @@ public class BotOverSeer
         return false;
     }
 
+    private void ProcessLikelyEnemyRadarPlant((int X, int Y) key)
+    {
+        (int X, int Y) keyForRadar = (key.X, key.Y);
+        if(!this.TrapAssignments.ContainsKey(keyForRadar) && key.Y > 0 && key.Y < this.MapHeight && key.X < this.MapWidth)
+        {
+            this.PossibleEnemyRadarQueue.Enqueue(keyForRadar);
+        }
+
+        keyForRadar = (key.X + 1, key.Y);
+        if(!this.TrapAssignments.ContainsKey(keyForRadar) && key.Y > 0 && key.Y < this.MapHeight && key.X < this.MapWidth)
+        {
+            this.PossibleEnemyRadarQueue.Enqueue(keyForRadar);
+        }
+        
+        keyForRadar = (key.X, key.Y + 1);
+        if(!this.TrapAssignments.ContainsKey(keyForRadar) && key.Y > 0 && key.Y < this.MapHeight && key.X < this.MapWidth)
+        {
+            this.PossibleEnemyRadarQueue.Enqueue(keyForRadar);
+        }
+
+        keyForRadar = (key.X, key.Y - 1);
+        if(!this.TrapAssignments.ContainsKey(keyForRadar) && key.Y > 0 && key.Y < this.MapHeight && key.X < this.MapWidth)
+        {
+            this.PossibleEnemyRadarQueue.Enqueue(keyForRadar);
+        }
+        
+        keyForRadar = (key.X - 1, key.Y);
+        if(!this.TrapAssignments.ContainsKey(keyForRadar) && key.Y > 0 && key.Y < this.MapHeight && key.X < this.MapWidth)
+        {
+            this.PossibleEnemyRadarQueue.Enqueue(keyForRadar);
+        }
+    }
+
     private void ProcessOreDigEvent(EntityEnemyData entityDigging)
     {
         List<(int X, int Y)> identifiedDigLocations 
@@ -391,7 +469,7 @@ public class BotOverSeer
         if(identifiedDigLocations.Count == 1) 
         {
             (int X, int Y) specificKey = (identifiedDigLocations[0].X, identifiedDigLocations[0].Y);
-            this.CancelOreAssignmentForLocation(specificKey, 1);
+            this.CancelDigAssignmentForLocation(specificKey, 1);
             return;
             
         }
@@ -399,7 +477,7 @@ public class BotOverSeer
         (int X, int Y) key = (entityDigging.X, entityDigging.Y);
         if(identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
-            this.CancelOreAssignmentForLocation(key, 1);
+            this.CancelDigAssignmentForLocation(key, 1);
         }
         // if(this.EnemyTrapRecords.TryGetValue(key, out bool trapConfirmedPresent) && trapConfirmedPresent)
         // {
@@ -409,7 +487,7 @@ public class BotOverSeer
         key = (entityDigging.X + 1, entityDigging.Y);
         if(identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
-            this.CancelOreAssignmentForLocation(key, 1);
+            this.CancelDigAssignmentForLocation(key, 1);
         }
         // if(this.EnemyTrapRecords.TryGetValue(key, out trapConfirmedPresent) && trapConfirmedPresent)
         // {
@@ -419,7 +497,7 @@ public class BotOverSeer
         key = (entityDigging.X, entityDigging.Y + 1);
         if(identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
-            this.CancelOreAssignmentForLocation(key, 1);
+            this.CancelDigAssignmentForLocation(key, 1);
         }
         // if(this.EnemyTrapRecords.TryGetValue(key, out trapConfirmedPresent) && trapConfirmedPresent)
         // {
@@ -429,7 +507,7 @@ public class BotOverSeer
         key = (entityDigging.X - 1, entityDigging.Y);
         if(identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
-            this.CancelOreAssignmentForLocation(key, 1);
+            this.CancelDigAssignmentForLocation(key, 1);
         }
         // if(this.EnemyTrapRecords.TryGetValue(key, out trapConfirmedPresent) && trapConfirmedPresent)
         // {
@@ -440,7 +518,7 @@ public class BotOverSeer
         key = (entityDigging.X, entityDigging.Y - 1);            
         if(identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
-            this.CancelOreAssignmentForLocation(key, 1);
+            this.CancelDigAssignmentForLocation(key, 1);
         }
         // if(this.EnemyTrapRecords.TryGetValue(key, out trapConfirmedPresent) && trapConfirmedPresent)
         // {
@@ -451,65 +529,108 @@ public class BotOverSeer
     public void ProcessFriendlyTrapEvent((int X, int Y) key)
     {
         this.EnemyTrapRecords[key] = true;
-        this.CancelOreAssignmentForLocation(key);
+        this.CancelDigAssignmentForLocation(key);
     }
 
     private void ProcessTrapPlantEvent(EntityEnemyData entityDataAtTimeOfTrapDrop)
     {
+        Console.Error.WriteLine($"Processing Trap drop event of Entity at ({entityDataAtTimeOfTrapDrop.X},{entityDataAtTimeOfTrapDrop.Y})");
         List<(int X, int Y)> identifiedDigLocations 
             = this.OreDugPriorRound
                 .Where((od) => Utility.GetOrthoDistance(entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y, od.X, od.Y) <= 1)
+                .Distinct()
                 .ToList();
+        
+        Console.Error.Write("Identified Ore Dug Locations at ");
+        foreach((int X, int Y) dugLoc in identifiedDigLocations)
+        {
+            Console.Error.Write($"({dugLoc.X},{dugLoc.Y})");
+        }
+        Console.Error.WriteLine();
         if(identifiedDigLocations.Count == 1) 
         {
+            Console.Error.WriteLine($" determined trap drop at ({identifiedDigLocations[0].X},{identifiedDigLocations[0].Y})");
             (int X, int Y) specificKey = (identifiedDigLocations[0].X, identifiedDigLocations[0].Y);
             this.EnemyTrapRecords[specificKey] = true;
-            this.CancelOreAssignmentForLocation(specificKey, 1);
+            this.CancelDigAssignmentForLocation(specificKey, 1);
             this.ScatterBotsAtLocation((specificKey.X, specificKey.Y), 1);
             this.RebuildOreIdentifiedQueue();
             return;
+        }
+
+        // Check if we can identify the trap by the holes dug last round.
+        // TODO there are a few more optimizations that could be done such as winnowowing out other nearby digs.
+        List<(int X, int Y)> holesDugPriorRoundAdjacent = this.HolesMadePriorRound.Where(hole => Utility.GetOrthoDistance(entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y, hole.X, hole.Y) <= 1).ToList();
+        Console.Error.Write("Identified Hole Dug Locations at ");
+        foreach((int X, int Y) dugLoc in holesDugPriorRoundAdjacent)
+        {
+            Console.Error.Write($"({dugLoc.X},{dugLoc.Y})");
+        }
+        Console.Error.WriteLine();
+        foreach((int X, int Y) holeLoc in holesDugPriorRoundAdjacent)
+        {
+            Console.Error.WriteLine($"Processing Hole At ({holeLoc.X},{holeLoc.Y})");
+            List<Bot> botsThatDugInRange = this.Bots.Values.Where(bot => bot.State == BotState.DIGGING && bot.Tx == holeLoc.X && bot.Ty == holeLoc.Y && Utility.GetOrthoDistance(holeLoc.X, holeLoc.Y, bot.X, bot.Y) <= 1).ToList();
+            List<EntityEnemyData> enemyBotsInRange = this.EnemyTrackingData.Values.Where(enemyBot => Utility.GetOrthoDistance(holeLoc.X, holeLoc.Y, enemyBot.X, enemyBot.Y) <= 1).ToList();
+            Console.Error.WriteLine($"botDigs: {botsThatDugInRange.Count} enemyBots: {enemyBotsInRange.Count}");
+
+            if (botsThatDugInRange.Count == 0 && enemyBotsInRange.Count == 1)
+            {
+                Console.Error.WriteLine($" determined trap drop by holes at ({holeLoc.X},{holeLoc.Y})");
+                (int X, int Y) specificHoleKey = (holeLoc.X, holeLoc.Y);
+                this.EnemyTrapRecords[specificHoleKey] = true;
+                this.CancelDigAssignmentForLocation(specificHoleKey, 1);
+                this.ScatterBotsAtLocation((specificHoleKey.X, specificHoleKey.Y), 1);
+                this.RebuildOreIdentifiedQueue();
+                return;
+            }
         }
 
         // Because we can't identify where the trap was placed, we have to flag all adjacent areas.
         (int X, int Y) key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y);
         if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
+            Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
             this.EnemyTrapRecords[key] 
                 = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
-                this.CancelOreAssignmentForLocation(key);
+                this.CancelDigAssignmentForLocation(key);
         }
         
 
         key = (entityDataAtTimeOfTrapDrop.X + 1, entityDataAtTimeOfTrapDrop.Y);
         if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
+            Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
             this.EnemyTrapRecords[key] 
                 = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
-                this.CancelOreAssignmentForLocation(key);
+                this.CancelDigAssignmentForLocation(key);
         }
 
         key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y + 1);
         if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
+            Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
             this.EnemyTrapRecords[key] 
                 = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
-                this.CancelOreAssignmentForLocation(key);
+                this.CancelDigAssignmentForLocation(key);
         }
 
         key = (entityDataAtTimeOfTrapDrop.X - 1, entityDataAtTimeOfTrapDrop.Y);
         if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
+            Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
             this.EnemyTrapRecords[key] 
                 = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
-                this.CancelOreAssignmentForLocation(key);
+                this.CancelDigAssignmentForLocation(key);
         }
 
         key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y - 1);
         if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
         {
+            Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
             this.EnemyTrapRecords[key] 
                 = this.EnemyTrapRecords.TryGetValue(key, out bool currentValue) && currentValue;
-                this.CancelOreAssignmentForLocation(key);
+                this.CancelDigAssignmentForLocation(key);
         }
 
         this.ScatterBotsAtLocation((entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y), 2);
@@ -546,7 +667,15 @@ public class BotOverSeer
         }
     }
 
-    private void CancelOreAssignmentForLocation((int X, int Y) key, int maxToCancel = 10)
+    private void CancelDigAssignmentForLocation((int X, int Y) key, int maxToCancel = 10)
+    {
+        this.CancelOreAssignmentForLocation(key, maxToCancel);
+        this.CancelRadarAssignmentForLocation(key);
+        this.CancelTrapAssignmentForLocation(key);
+
+    }
+
+    private void CancelOreAssignmentForLocation((int X, int Y) key, int maxToCancel)
     {
         int cancelCount = 0;
         if(this.OreAssignments.TryGetValue(key, out OreAssignment oreAssignment))
@@ -566,11 +695,35 @@ public class BotOverSeer
         }
     }
 
+    private void CancelRadarAssignmentForLocation((int X, int Y) key)
+    {
+        if(this.RadarAssignments.TryGetValue(key, out RadarAssignment radarAssignment))
+        {
+            Bot botToPotentiallyRecall = this.Bots[radarAssignment.BotId];
+            if(botToPotentiallyRecall.Tx == key.X && botToPotentiallyRecall.Ty == key.Y)
+            {
+                botToPotentiallyRecall.OverrideBotState(BotState.IDLE);
+            }
+        }
+    }
+
+    private void CancelTrapAssignmentForLocation((int X, int Y) key)
+    {
+        if(this.TrapAssignments.TryGetValue(key, out TrapAssignment trapAssignment))
+        {
+            Bot botToPotentiallyRecall = this.Bots[trapAssignment.BotId];
+            if(botToPotentiallyRecall.Tx == key.X && botToPotentiallyRecall.Ty == key.Y)
+            {
+                botToPotentiallyRecall.OverrideBotState(BotState.IDLE);
+            }
+        }
+    }
+
     private void LogDiagnostics()
     {
-        Console.Error.Write("Trap Records");
+        Console.Error.Write("Dug Prior Records");
         int printCount = 0;
-        foreach((int X, int Y) key in this.EnemyTrapRecords.Keys)
+        foreach((int X, int Y) key in this.OreDugPriorRound)
         {
             if(++printCount > 5)
             {
@@ -583,6 +736,24 @@ public class BotOverSeer
             }
         }
         Console.Error.WriteLine();
+
+        
+
+        // Console.Error.Write("Trap Records");
+        // printCount = 0;
+        // foreach((int X, int Y) key in this.EnemyTrapRecords.Keys)
+        // {
+        //     if(++printCount > 5)
+        //     {
+        //         printCount = 0;
+        //         Console.Error.WriteLine($"(   {key.X}, {key.Y})");
+        //     }
+        //     else
+        //     {
+        //         Console.Error.Write($"| ({key.X}, {key.Y})");
+        //     }
+        // }
+        // Console.Error.WriteLine();
 
         // Console.Error.Write("Ore Present Queue");
         // printCount = 0;
@@ -639,8 +810,14 @@ public class BotOverSeer
         // Console.Error.WriteLine();
     }
     
+    private void ClearSingleRoundData()
+    {
+        this.OreDugPriorRound = new List<(int X, int Y)>();
+        this.HolesMadePriorRound = new List<(int X, int Y)>();
+    }
+
     private bool NeedOreIdQueueRebuilt() => ++this.RoundsSinceQueueRebuild > 10;
-    private void RebuildOreIdentifiedQueue()
+    private bool RebuildOreIdentifiedQueue()
     {
         this.RoundsSinceQueueRebuild = 0;
         this.OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>();
@@ -655,13 +832,14 @@ public class BotOverSeer
                     OreWasIdentifiedAsPresentQueue.Enqueue(kvp.Key);
                 }
             }
-            if(OreWasIdentifiedAsPresentQueue.Count > 20)
+            if(OreWasIdentifiedAsPresentQueue.Count > 30)
             {
                 this.IdentifiedOreLow = false;
-                return;
+                return true;
             }
         }
         this.IdentifiedOreLow = true;
+        return true;
     }
     private bool NeedRadarOverride()
     {
@@ -704,7 +882,72 @@ public class BotOverSeer
         return false;
     }
 
-    public bool ShouldTrap() => this.TrapCoolDown == 0;
+    private bool NeedEnemyRadarOverride() => this.PossibleEnemyRadarQueue.Count > 0 && !this.Bots.Values.Any(bot => bot.State == BotState.RADAR_SABOTAGE);
+
+    private bool HandleEnemyRadarOverride()
+    {
+        // First pass check for bots that are not fetching
+        foreach (Bot bot in this.GetBotsPerformingLowValueWork().OrderBy((bot) => bot.X))
+        {
+            if(bot.OverrideBotState(BotState.RADAR_SABOTAGE))
+            {
+                return true;
+            }
+        }
+
+        int furthestBot = -1;
+        int furthestBotDistanceToHq = -1;
+
+        foreach (Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR && bot.State != BotState.DEAD))
+        {
+            int distanceToHq = bot.X;
+            if(distanceToHq > furthestBotDistanceToHq)
+            {
+                furthestBot = bot.EntityId;
+                furthestBotDistanceToHq = distanceToHq;          
+            }
+        }
+
+        if(furthestBot != -1 && this.Bots[furthestBot].OverrideBotState(BotState.RADAR_SABOTAGE))
+        {
+            return true;
+        }
+        
+        return false;
+    }
+
+    private bool ShouldSackABot()
+    {
+        bool botWillBeSacked = false;
+        List<(int X, int Y)> knownBombs = this.EnemyTrapRecords.Where(kvp => kvp.Value).Select(kvp => kvp.Key).ToList();
+        foreach((int X, int Y) bombKey in knownBombs)
+        {
+           int enemiesInRange = 0;
+           foreach(EntityEnemyData enemyBot in this.EnemyTrackingData.Values)
+           {
+                if(Utility.GetOrthoDistance(bombKey.X, bombKey.Y, enemyBot.X, enemyBot.Y) <= 1)
+                {
+                    enemiesInRange++;
+                }
+           }
+           if(enemiesInRange >= 2)
+           {
+                foreach(Bot sackBot in this.Bots.Values.Where(b => b.State != BotState.DEAD && b.State != BotState.SACK))
+                {
+                    if(Utility.GetOrthoDistance(bombKey.X, bombKey.Y, sackBot.X, sackBot.Y) <= 1)
+                    {
+                        sackBot.Tx = bombKey.X;
+                        sackBot.Ty = bombKey.Y;
+                        sackBot.OverrideBotState(BotState.SACK);
+                        botWillBeSacked = true;
+                    }
+                }
+           }
+        }
+        return botWillBeSacked;
+    }
+
+    public bool ShouldTrap() => this.TrapCoolDown == 0 && !this.Bots.Values.Any(b => b.SubState == BotSubState.JUKE_REQUEST && b.State == BotState.TRAPPING_TRAVEL);
 
     private IEnumerable<Bot> GetBotsPerformingLowValueWork()
     {
@@ -793,6 +1036,7 @@ public class Bot
             BotState.DEAD => true,
             BotState.TRAPPING_TRAVEL => true,
             BotState.TRAPPING => true,
+            BotState.RADAR_SABOTAGE => true,
             _ => false
         };  
     }
@@ -820,6 +1064,8 @@ public class Bot
             BotState.DEAD => (BotState.DEAD, BotSubState.UNUSED),
             BotState.TRAPPING_TRAVEL => this.ProcessTrappingTravelState(),
             BotState.TRAPPING => this.ProcessTrappingState(),
+            BotState.RADAR_SABOTAGE => this.ProcessRadarSabotageState(),
+            BotState.SACK => (BotState.SACK, BotSubState.UNUSED),
             _ => this.ProcessIdleState()
         };
     }
@@ -836,7 +1082,7 @@ public class Bot
             return (BotState.DEPOSITING, BotSubState.UNUSED);
         }
 
-
+        // We will use an ore assignment if trapping or fetching
         (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId);
         if(this.ItemType == ItemType.TRAP)
         {
@@ -915,7 +1161,7 @@ public class Bot
         }
 
         (this.Tx, this.Ty) = this.OverSeer.GetTrapAssignment(this.EntityId);
-        return (BotState.TRAPPING_TRAVEL, BotSubState.UNUSED);
+        return (BotState.TRAPPING_TRAVEL, r.Next(0, 1) == 0 ? BotSubState.JUKE_REQUEST : BotSubState.UNUSED);
     }
 
     private (BotState, BotSubState) ProcessRadarRetrieveState()
@@ -997,6 +1243,11 @@ public class Bot
 
     private (BotState, BotSubState) ProcessTrappingTravelState()
     {
+        if(this.ItemType == ItemType.NONE && this.SubState == BotSubState.JUKE_REQUEST)
+        {            
+            return (BotState.TRAPPING_TRAVEL, this.X != 1 ? BotSubState.JUKE_REQUEST : BotSubState.UNUSED);
+        }
+        
         if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) <= 1)
         {
             return (BotState.TRAPPING, BotSubState.UNUSED);
@@ -1015,7 +1266,29 @@ public class Bot
         return (BotState.TRAPPING, BotSubState.UNUSED);
     }
 
-    
+    private (BotState, BotSubState) ProcessRadarSabotageState()
+    {
+        if(this.SubState == BotSubState.RADAR_SABOTAGE_RELOCATE)
+        {
+            return (BotState.RADAR_SABOTAGE, Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) < 1 ? BotSubState.UNUSED : BotSubState.RADAR_SABOTAGE_RELOCATE);
+        }
+
+        if(this.SubState == BotSubState.UNUSED)
+        {
+            (int X, int Y) radKey = this.OverSeer.GetRadarSabotageAssignment(this.EntityId);
+            if (radKey != default)
+            {
+                this.Tx = radKey.X; 
+                this.Ty = radKey.Y;
+
+                return (BotState.RADAR_SABOTAGE, Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) <= 1 ? BotSubState.UNUSED : BotSubState.RADAR_SABOTAGE_RELOCATE);
+            }
+            
+        }
+
+        return this.ProcessIdleState();
+
+    }
 
     #endregion
 
@@ -1034,6 +1307,8 @@ public class Bot
             BotState.SCATTER => this.ProcessScatterOutput(),
             BotState.TRAPPING_TRAVEL => this.ProcessTrappingTravelOutput(),
             BotState.TRAPPING => this.ProcessTrappingOutput(),
+            BotState.RADAR_SABOTAGE => this.ProcessRadarSabotageOutput(),
+            BotState.SACK => this.BuildDig(this.Tx, this.Ty),
             _ => this.ProcessIdleOutput()
         };
     }
@@ -1115,9 +1390,14 @@ public class Bot
 
     public string ProcessTrappingTravelOutput()
     {
+        if(this.SubState == BotSubState.JUKE_REQUEST)
+        {
+            return this.BuildMove(1, this.Ty);
+        }
+
         if(this.ItemType != ItemType.TRAP)
         {
-            if(this.X != 0)
+            if(this.X > 1)
             {
                 Console.Error.WriteLine($"Bot at ({this.X},{this.Y}) is trapping when it probably shouldnt be");
             }
@@ -1132,6 +1412,19 @@ public class Bot
         Console.Error.WriteLine($"Logging Friendly Trap at ({this.Tx},{this.Ty})");
         this.OverSeer.ProcessFriendlyTrapEvent((this.Tx, this.Ty));
         return this.BuildDig(this.Tx, this.Ty);
+    }
+
+    public string ProcessRadarSabotageOutput()
+    {
+        if(this.SubState == BotSubState.RADAR_SABOTAGE_RELOCATE)
+        {
+            Console.Error.WriteLine($"Radar Sabotage Relocate for radar at ({this.Tx},{this.Ty})");
+            return this.BuildMove(this.Tx, this.Ty);
+        }
+
+        Console.Error.WriteLine($"Radar Sabotage dig at ({this.Tx},{this.Ty})");
+        return this.BuildDig(this.Tx, this.Ty);
+
     }
     #endregion
 }
@@ -1266,12 +1559,16 @@ public enum BotState
     DEAD,
     TRAPPING_TRAVEL,
     TRAPPING,
+    RADAR_SABOTAGE,
+    SACK
 }
 
 public enum BotSubState
 {
     UNUSED,
-    DIG_SHOULD_BE_OVER
+    DIG_SHOULD_BE_OVER,
+    JUKE_REQUEST,
+    RADAR_SABOTAGE_RELOCATE
 }
 
 public enum EntityType
