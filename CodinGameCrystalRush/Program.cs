@@ -128,6 +128,8 @@ public class BotOverSeer
     public Dictionary<int, Bot> Bots { get; private set; }
     public Dictionary<(int X, int Y), OreStruct> OreData { get; private set; }
 
+    public Queue<BotActionData> botActionsPriorRound = new Queue<BotActionData>();
+
     private Queue<(int X, int Y)> OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>();
     private Queue<(int X, int Y)> DefaultQueue = new Queue<(int X, int Y)>();
     private Queue<(int X, int Y)> PossibleEnemyRadarQueue = new Queue<(int X, int Y)>();
@@ -356,6 +358,7 @@ public class BotOverSeer
     public void ProcessDuty(EntityData[] entities)
     {
         this.ProcessFriendlyBotDeath(entities);
+        this.ProcessBotActionsPriorRound();
         while(this.TrapEventsToProcess.Count > 0)
         {
             EntityEnemyData newEnemyData = this.TrapEventsToProcess.Dequeue();
@@ -388,6 +391,14 @@ public class BotOverSeer
         if(!this.OreData.ContainsKey(key))
         {
             this.OreData[key] = oreStruct;
+            if(oreStruct.HolePresent == false)
+            {
+                this.TrapAssignments.Remove(key);
+                for(int i = 0; i < oreStruct.OreCount; i++)
+                {
+                    this.OreWasIdentifiedAsPresentQueue.Enqueue(key);
+                }
+            }
             return true;
         }
 
@@ -418,6 +429,10 @@ public class BotOverSeer
             {
                 this.OreDugPriorRound.Add(key);
                 this.TrapAssignments.Remove(key);
+                for(int j = 0; j < oreStruct.OreCount; j++)
+                {
+                    this.OreWasIdentifiedAsPresentQueue.Enqueue(key);
+                }
             }
         }
 
@@ -650,9 +665,10 @@ public class BotOverSeer
                 }
             }
 
-            // Because we can't identify where the trap was placed, we have to flag all adjacent areas.
+            // Because we can't identify where the trap was placed, we have consider flagging all adjacent areas.
             (int X, int Y) key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y);
-            if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
+            bool haveOreData = this.OreData.TryGetValue(key, out OreStruct oreData);
+            if((identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y)) && (!haveOreData || oreData.HolePresent || !oreData.HasBeenIdentified))
             {
                 Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
                 this.EnemyTrapRecords[key]
@@ -662,7 +678,8 @@ public class BotOverSeer
 
 
             key = (entityDataAtTimeOfTrapDrop.X + 1, entityDataAtTimeOfTrapDrop.Y);
-            if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
+            haveOreData = this.OreData.TryGetValue(key, out oreData);
+            if((identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y)) && (!haveOreData || oreData.HolePresent || !oreData.HasBeenIdentified))
             {
                 Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
                 this.EnemyTrapRecords[key]
@@ -671,7 +688,8 @@ public class BotOverSeer
             }
 
             key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y + 1);
-            if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
+            haveOreData = this.OreData.TryGetValue(key, out oreData);
+            if((identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y)) && (!haveOreData || oreData.HolePresent || !oreData.HasBeenIdentified))
             {
                 Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
                 this.EnemyTrapRecords[key]
@@ -680,7 +698,8 @@ public class BotOverSeer
             }
 
             key = (entityDataAtTimeOfTrapDrop.X - 1, entityDataAtTimeOfTrapDrop.Y);
-            if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
+            haveOreData = this.OreData.TryGetValue(key, out oreData);
+            if((identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y)) && (!haveOreData || oreData.HolePresent || !oreData.HasBeenIdentified))
             {
                 Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
                 this.EnemyTrapRecords[key]
@@ -689,7 +708,8 @@ public class BotOverSeer
             }
 
             key = (entityDataAtTimeOfTrapDrop.X, entityDataAtTimeOfTrapDrop.Y - 1);
-            if(identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y))
+            haveOreData = this.OreData.TryGetValue(key, out oreData);
+            if((identifiedDigLocations.Count == 0 || identifiedDigLocations.Any((od) => od.X == key.X && od.Y == key.Y)) && (!haveOreData || oreData.HolePresent || oreData.HasBeenIdentified == false))
             {
                 Console.Error.WriteLine($" cautioning of trap drop at ({key.X},{key.Y})");
                 this.EnemyTrapRecords[key]
@@ -739,6 +759,32 @@ public class BotOverSeer
             if(entity.X == -1 && entity.Y == -1)
             {
                 _ = this.Bots.TryGetValue(entity.EntityId, out Bot bot) && bot.State != BotState.DEAD && bot.OverrideBotState(BotState.DEAD);
+            }
+        }
+    }
+
+    private void ProcessBotActionsPriorRound()
+    {
+        foreach(BotActionData act in this.botActionsPriorRound)
+        {
+            switch (act.Action)
+            {
+                case BotAct.WAIT:
+                    break;
+
+                case BotAct.MOVE:
+                    break;
+
+                case BotAct.DIG:
+                    if(act.Item == ItemType.RADAR)
+                    {
+                        this.RadarsActivePriorRound.Add((act.X, act.Y));
+                    }
+                    this.OreDugPriorRound.Remove((act.X, act.Y));
+                    break;
+
+                case BotAct.REQUEST:
+                    break;
             }
         }
     }
@@ -1656,21 +1702,25 @@ public static class Utility
     #region Command Building
     public static string BuildWait(this Bot bot)
     {
+        bot.OverSeer.botActionsPriorRound.Enqueue( new BotActionData { Action = BotAct.WAIT, X = bot.X, Y = bot.Y });
         return "WAIT";
     }
 
     public static string BuildMove(this Bot bot, int x, int y)
     {
+        bot.OverSeer.botActionsPriorRound.Enqueue(new BotActionData { Action = BotAct.MOVE, X = x, Y = y });
         return $"MOVE {x} {y}";
     }
 
     public static string BuildDig(this Bot bot, int x, int y)
     {
+        bot.OverSeer.botActionsPriorRound.Enqueue(new BotActionData { Action = BotAct.DIG, X = x, Y = y, Item = bot.ItemType });
         return $"DIG {x} {y}";
     }
 
     public static string BuildRequest(this Bot bot, ItemType itemType)
     {
+        bot.OverSeer.botActionsPriorRound.Enqueue(new BotActionData { Action = BotAct.REQUEST, X = bot.X, Y = bot.Y, Item = itemType });
         return $"REQUEST {itemType.ToString("G")}";
     }
     #endregion
@@ -1759,6 +1809,23 @@ public struct EntityEnemyData
     }
 
 }
+
+public struct BotActionData
+{
+    public BotAct Action;
+    public int X;
+    public int Y;
+    public ItemType Item;
+}
+
+public enum BotAct
+{
+    DIG,
+    MOVE,
+    WAIT,
+    REQUEST
+}
+
 
 public enum BotState
 {
