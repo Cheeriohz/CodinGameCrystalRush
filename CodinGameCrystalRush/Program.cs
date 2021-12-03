@@ -417,6 +417,7 @@ public class BotOverSeer
             for(int i = 0; i < currentOreStruct.OreCount - oreStruct.OreCount; i++)
             {
                 this.OreDugPriorRound.Add(key);
+                this.TrapAssignments.Remove(key);
             }
         }
 
@@ -737,7 +738,7 @@ public class BotOverSeer
         {
             if(entity.X == -1 && entity.Y == -1)
             {
-                _ = this.Bots.TryGetValue(entity.EntityId, out Bot bot) && bot.OverrideBotState(BotState.DEAD);
+                _ = this.Bots.TryGetValue(entity.EntityId, out Bot bot) && bot.State != BotState.DEAD && bot.OverrideBotState(BotState.DEAD);
             }
         }
     }
@@ -762,6 +763,8 @@ public class BotOverSeer
             }
         }
 
+        List<(int orthoDistance, Bot bot)> botsEligibleForCancel = new List<(int, Bot)>();
+
         int cancelCount = 0;
         if(this.OreAssignments.TryGetValue(key, out OreAssignment oreAssignment))
         {
@@ -770,15 +773,22 @@ public class BotOverSeer
                 Bot botToPotentiallyRecall = this.Bots[botId];
                 if(botToPotentiallyRecall.Tx == key.X && botToPotentiallyRecall.Ty == key.Y)
                 {
-                    if(Utility.GetOrthoDistance(botToPotentiallyRecall.X, botToPotentiallyRecall.Y, key.X, key.Y) >= orthDistanceForDigToBeat)
+                    int orthoDistance = Utility.GetOrthoDistance(botToPotentiallyRecall.X, botToPotentiallyRecall.Y, key.X, key.Y);
+                    if(orthoDistance >= orthDistanceForDigToBeat)
                     {
-                        botToPotentiallyRecall.OverrideBotState(BotState.IDLE);
-                        if(++cancelCount >= maxToCancel)
-                        {
-                            return;
-                        }
+                        botsEligibleForCancel.Add((orthoDistance, botToPotentiallyRecall));
+                        
                     }
                 }
+            }
+        }
+        
+        foreach((int orthoDistance, Bot bot) in botsEligibleForCancel.OrderBy(botNDistance => -botNDistance.orthoDistance))
+        {
+            bot.OverrideBotState(BotState.IDLE);
+            if(++cancelCount >= maxToCancel)
+            {
+                return;
             }
         }
     }
