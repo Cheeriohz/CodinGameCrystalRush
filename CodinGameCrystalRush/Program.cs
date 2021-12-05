@@ -32,6 +32,8 @@ class Player
             executionTimer.Start();
             int myScore = int.Parse(inputs[0]); // Amount of ore delivered
             int opponentScore = int.Parse(inputs[1]);
+            overSeer.MyScore = myScore;
+            overSeer.OpponentScore = opponentScore;
             for(int i = 0; i < height; i++)
             {
                 inputs = Console.ReadLine().Split(' ');
@@ -162,6 +164,7 @@ public class BotOverSeer
     private bool IdentifiedOreLow { get; set; } = true;
     private bool OffsetRadar { get; set; } = false;
     private bool? RadarsTopDown { get; set; } = null;
+    private int RadarOptimizationCooldown { get; set; } = 0;
     private int RoundsSinceQueueRebuild { get; set; } = 0;
 
     private int EnemyXMax { get; set; } = 10;
@@ -172,6 +175,8 @@ public class BotOverSeer
 
     public int TurnCount { get; set; } = 0;
 
+    public int MyScore { get; set; } = 0;
+    public int OpponentScore { get; set; } = 0;
 
 
     public BotOverSeer(int mapHeight, int mapWidth, Dictionary<int, Bot> bots, Dictionary<(int, int), OreStruct> oreData)
@@ -204,18 +209,29 @@ public class BotOverSeer
         return key;
     }
 
-    public (int X, int Y) GetOreAssignment(int entityId, bool canReorderQueue = true)
+    public (int X, int Y) GetOreAssignment(int entityId, bool canReorderQueue = true, bool removeEntryFromQueue = true)
     {
-        if(canReorderQueue) this.OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>(this.OreWasIdentifiedAsPresentQueue.OrderBy((oId) =>
-        {
-            int ortho = Utility.GetOrthoDistance(this.Bots[entityId].X, this.Bots[entityId].Y, oId.X, oId.Y);
-            return (ortho / 3);
-        }).ThenBy(oID => oID.X));
+        if(canReorderQueue) this.OreWasIdentifiedAsPresentQueue = new Queue<(int X, int Y)>(this.OreWasIdentifiedAsPresentQueue
+            .OrderBy((oId) => Utility.GetOrthoDistanceTurnCost(this.Bots[entityId].X, this.Bots[entityId].Y, oId.X, oId.Y))
+            .ThenBy(oID => oID.X));
         if(this.OreWasIdentifiedAsPresentQueue.TryDequeue(out (int X, int Y) idLoc))
         {
-            return this.EnemyTrapRecords.ContainsKey(idLoc)
-                ? this.GetOreAssignment(entityId, false)
-                : this.ProcessOreAssignment(idLoc, entityId);
+            // If this entry is now know to have a trap just recursively process again. Force reorder ignore as we don't need to reorder twice.
+            if(this.EnemyTrapRecords.ContainsKey(idLoc))
+            {
+                return this.GetOreAssignment(entityId, false, removeEntryFromQueue);
+            }
+            else
+            {
+                // if we are removing the entry from the queue finish the processing.
+                if(removeEntryFromQueue)
+                {
+                    return this.ProcessOreAssignment(idLoc, entityId);
+                }
+
+                this.OreWasIdentifiedAsPresentQueue.Enqueue(idLoc);
+                return idLoc;
+            }
         }
 
         if(this.TurnCount < 60)
@@ -228,9 +244,22 @@ public class BotOverSeer
             this.DefaultQueue = new Queue<(int X, int Y)>(this.DefaultQueue.OrderBy((oId) => Utility.GetOrthoDistance(this.Bots[entityId].X, this.Bots[entityId].Y, oId.X, oId.Y)).ThenBy(q => q.X));
             if(this.DefaultQueue.TryDequeue(out (int X, int Y) defaultLoc))
             {
-                return this.EnemyTrapRecords.ContainsKey(defaultLoc)
-                ? this.GetOreAssignment(entityId, false)
-                : this.ProcessOreAssignment(defaultLoc, entityId);
+                // If this entry is now know to have a trap just recursively process again. Force reorder ignore as we don't need to reorder twice.
+                if(this.EnemyTrapRecords.ContainsKey(defaultLoc))
+                {
+                    return this.GetOreAssignment(entityId, false, removeEntryFromQueue);
+                }
+                else
+                {
+                    // if we are removing the entry from the queue finish the processing.
+                    if(removeEntryFromQueue)
+                    {
+                        return this.ProcessOreAssignment(defaultLoc, entityId);
+                    }
+
+                    this.DefaultQueue.Enqueue(defaultLoc);
+                    return defaultLoc;
+                }
             }
         }
 
@@ -242,7 +271,11 @@ public class BotOverSeer
                 && !this.OreAssignments.ContainsKey(oreLocation.Key)
                 && !this.EnemyTrapRecords.ContainsKey(oreLocation.Key))
             {
-                return this.ProcessOreAssignment(oreLocation.Key, entityId);
+                if(removeEntryFromQueue)
+                {
+                    return this.ProcessOreAssignment(oreLocation.Key, entityId);
+                }
+                return oreLocation.Key;
             }
         }
 
@@ -253,7 +286,11 @@ public class BotOverSeer
                 && !this.OreAssignments.ContainsKey(oreLocation.Key)
                 && !this.EnemyTrapRecords.ContainsKey(oreLocation.Key))
             {
-                return this.ProcessOreAssignment(oreLocation.Key, entityId);
+                if(removeEntryFromQueue)
+                {
+                    return this.ProcessOreAssignment(oreLocation.Key, entityId);
+                }
+                return oreLocation.Key;
             }
         }
 
@@ -321,13 +358,22 @@ public class BotOverSeer
         return key;
     }
 
-    private (int X, int Y) GetInitialRadarAssignmentLocation() => (3 + RADAR_RANGE / 2, 1 + (RADAR_RANGE / 2) + RADAR_RANGE);
+    private (int X, int Y) GetInitialRadarAssignmentLocation() => (2 + RADAR_RANGE / 2, 1 + (RADAR_RANGE / 2) + RADAR_RANGE);
 
-    public (int X, int Y) GetRadarAssignment(int entityId)
+    public (int X, int Y) GetRadarAssignment(int entityId, bool checkOnly = false)
     {
         if(this.RadarAssignments.Count == 0)
         {
             (int initialX, int initialY) = this.GetInitialRadarAssignmentLocation();
+            Bot initialBot = this.Bots[entityId];
+
+            int distanceToNormalLocation = Utility.GetOrthoDistance(initialBot.X, initialBot.Y, initialX, initialY);
+            if(distanceToNormalLocation > 4)
+            {
+                initialX += distanceToNormalLocation % 4;
+            }
+
+
             this.OffsetRadar = false;
             this.RadarAssignments[(initialX, initialY)] = new RadarAssignment { BotId = entityId };
             return (initialX, initialY);
@@ -351,69 +397,75 @@ public class BotOverSeer
             this.RadarsTopDown = this.OreWasEverPresent.Where(o => o.Y < (this.MapHeight / 2)).Count() > this.OreWasEverPresent.Where(o => o.Y > (this.MapHeight / 2)).Count();
         }
 
-        KeyValuePair<(int X, int Y), RadarAssignment> lastAssignment = this.RadarAssignments.Last();
+        (int X, int Y) lastAssignment 
+            = (checkOnly && this.RadarAssignments.Count > 1)
+                ? this.RadarAssignments.TakeLast(2).Skip(1).First().Key 
+                : this.RadarAssignments.Count == 1 
+                    ? this.GetInitialRadarAssignmentLocation() 
+                    : this.RadarAssignments.Last().Key;
+
         if(this.RadarsTopDown ?? true)
         {
-            if(lastAssignment.Key.Y + (2 * RADAR_RANGE) >= this.MapHeight)
+            if(lastAssignment.Y + (2 * RADAR_RANGE) >= this.MapHeight)
             {
-                if(lastAssignment.Key.X + RADAR_RANGE >= this.MapWidth)
+                if(lastAssignment.X + RADAR_RANGE >= this.MapWidth)
                 {
-                    this.Bots[entityId].OverrideBotState(BotState.IDLE);
+                    if(!checkOnly) this.Bots[entityId].OverrideBotState(BotState.IDLE);
                     this.BaseRadarNeedsMet = true;
-                    return (1, this.Bots[entityId].Y);
+                    return checkOnly ? (1, 5) : (1, this.Bots[entityId].Y);
                 }
 
                 if(this.OffsetRadar)
                 {
-                    this.OffsetRadar = false;
-                    int tNewColumnXOffset = lastAssignment.Key.X + RADAR_RANGE;
+                    if(!checkOnly) this.OffsetRadar = false;
+                    int tNewColumnXOffset = lastAssignment.X + RADAR_RANGE;
                     int tNewColumnYOffset = (1 + RADAR_RANGE / 2) + RADAR_RANGE;
-                    this.RadarAssignments[(tNewColumnXOffset, tNewColumnYOffset)] = new RadarAssignment { BotId = entityId };
+                    if(!checkOnly) this.RadarAssignments[(tNewColumnXOffset, tNewColumnYOffset)] = new RadarAssignment { BotId = entityId };
                     return (tNewColumnXOffset, tNewColumnYOffset);
                 }
-                this.OffsetRadar = true;
-                int tNewColumnX = lastAssignment.Key.X + RADAR_RANGE;
+                if(!checkOnly) this.OffsetRadar = true;
+                int tNewColumnX = lastAssignment.X + RADAR_RANGE;
                 int tNewColumnY = 1 + RADAR_RANGE / 2;
-                this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId = entityId };
+                if(!checkOnly) this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId = entityId };
                 return (tNewColumnX, tNewColumnY);
 
             }
 
-            int tNewRowX = lastAssignment.Key.X;
-            int tNewRowY = lastAssignment.Key.Y + (2 * RADAR_RANGE);
-            this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId = entityId };
+            int tNewRowX = lastAssignment.X;
+            int tNewRowY = lastAssignment.Y + (2 * RADAR_RANGE);
+            if(!checkOnly) this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId = entityId };
             return (tNewRowX, tNewRowY);
         }
         else
         {
-            if(lastAssignment.Key.Y - (2 * RADAR_RANGE) < 0)
+            if(lastAssignment.Y - (2 * RADAR_RANGE) < 0)
             {
-                if(lastAssignment.Key.X + RADAR_RANGE >= this.MapWidth)
+                if(lastAssignment.X + RADAR_RANGE >= this.MapWidth)
                 {
-                    this.Bots[entityId].OverrideBotState(BotState.IDLE);
+                    if(!checkOnly) this.Bots[entityId].OverrideBotState(BotState.IDLE);
                     this.BaseRadarNeedsMet = true;
-                    return (1, this.Bots[entityId].Y);
+                    return checkOnly ? (1, 5) : (1, this.Bots[entityId].Y);
                 }
 
                 if(this.OffsetRadar)
                 {
-                    this.OffsetRadar = false;
-                    int tNewColumnXOffset = lastAssignment.Key.X + RADAR_RANGE;
+                    if(!checkOnly) this.OffsetRadar = false;
+                    int tNewColumnXOffset = lastAssignment.X + RADAR_RANGE;
                     int tNewColumnYOffset = (1 + RADAR_RANGE / 2) + RADAR_RANGE;
-                    this.RadarAssignments[(tNewColumnXOffset, tNewColumnYOffset)] = new RadarAssignment { BotId = entityId };
+                    if(!checkOnly) this.RadarAssignments[(tNewColumnXOffset, tNewColumnYOffset)] = new RadarAssignment { BotId = entityId };
                     return (tNewColumnXOffset, tNewColumnYOffset);
                 }
-                this.OffsetRadar = true;
-                int tNewColumnX = lastAssignment.Key.X + RADAR_RANGE;
+                if(!checkOnly) this.OffsetRadar = true;
+                int tNewColumnX = lastAssignment.X + RADAR_RANGE;
                 int tNewColumnY = this.MapHeight - 1 - (RADAR_RANGE / 2);
-                this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId = entityId };
+                if(!checkOnly) this.RadarAssignments[(tNewColumnX, tNewColumnY)] = new RadarAssignment { BotId = entityId };
                 return (tNewColumnX, tNewColumnY);
 
             }
 
-            int tNewRowX = lastAssignment.Key.X;
-            int tNewRowY = lastAssignment.Key.Y - (2 * RADAR_RANGE);
-            this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId = entityId };
+            int tNewRowX = lastAssignment.X;
+            int tNewRowY = lastAssignment.Y - (2 * RADAR_RANGE);
+            if(!checkOnly) this.RadarAssignments[(tNewRowX, tNewRowY)] = new RadarAssignment { BotId = entityId };
             return (tNewRowX, tNewRowY);
         }
 
@@ -440,8 +492,12 @@ public class BotOverSeer
 
         bool oreQueueRebuildUsed = this.NeedOreIdQueueRebuilt() && this.RebuildOreIdentifiedQueue();
 
+        this.CheckForBotRadarOptimization();
+
         this.CheckForOreAssignmentOptimization();
         this.CheckForEnemyLikelyToStealOre();
+
+        
 
         this.LogDiagnostics();
         this.TurnCount++;
@@ -1029,9 +1085,60 @@ public class BotOverSeer
         }
 
     }
+
+    private void CheckForBotRadarOptimization()
+    {
+        if(this.TurnCount < 4) return;
+        if(this.RadarOptimizationCooldown-- > 0) return;
+
+        List<Bot> botsForConsideration = this.Bots.Values.Where(b => b.X < 9 && (b.ItemType == ItemType.NONE || b.ItemType == ItemType.ORE)).ToList();
+        Bot botWithRadarDuty = botsForConsideration.FirstOrDefault(b => b.State == BotState.RADAR_RETRIEVE);
+        if(botWithRadarDuty != null)
+        {
+            (int Rx, int Ry) = this.GetRadarAssignment(0, true);
+            int bestDeliveryTimeForRadar = Utility.GetOrthoDistanceTurnCost(0, botWithRadarDuty.Y, Rx, Ry)
+                        + botWithRadarDuty.X == 0 ? 0 : this.TimeToReturnToBase(botWithRadarDuty);
+            int testDeliveryTimeForRadar = 100;
+            Bot bestBotForDelivery = botWithRadarDuty;
+
+            foreach(Bot possBot in botsForConsideration)
+            {
+                if(possBot != bestBotForDelivery)
+                {
+                    testDeliveryTimeForRadar = Utility.GetOrthoDistanceTurnCost(0, botWithRadarDuty.Y, Rx, Ry)
+                        + possBot.X == 0 ? 0 : this.TimeToReturnToBase(possBot);
+                    if(testDeliveryTimeForRadar < bestDeliveryTimeForRadar)
+                    {
+                        bestBotForDelivery = possBot;
+                        bestDeliveryTimeForRadar = testDeliveryTimeForRadar;
+                    }    
+                }
+            }
+
+            if(bestBotForDelivery != botWithRadarDuty)
+            {
+                Console.Error.WriteLine($"Swapping to optimal radar delivery from Bot {botWithRadarDuty.EntityId} to Bot {bestBotForDelivery.EntityId} ");
+
+                BotState cacheState = bestBotForDelivery.State;
+                BotSubState cacheSubState = bestBotForDelivery.SubState;
+                int cacheTx = bestBotForDelivery.Tx;
+                int cacheTy = bestBotForDelivery.Ty;
+
+                bestBotForDelivery.OverrideBotState(botWithRadarDuty.State, botWithRadarDuty.SubState);
+                bestBotForDelivery.Tx = botWithRadarDuty.Tx;
+                bestBotForDelivery.Ty = botWithRadarDuty.Ty;
+
+                botWithRadarDuty.OverrideBotState(cacheState, cacheSubState);
+                botWithRadarDuty.Tx = cacheTx;
+                botWithRadarDuty.Ty = cacheTy;
+                this.RadarOptimizationCooldown = 4;
+            }
+        }
+    }
+
     private void CheckForOreAssignmentOptimization()
     {
-        Bot[] botsEnrouteToOre = this.Bots.Values.Where(b => b.State == BotState.FETCHING).OrderBy(b => b.X + b.Y).ToArray();
+        Bot[] botsEnrouteToOre = this.Bots.Values.Where(b => b.State == BotState.FETCHING && this.OreData[(b.Tx, b.Ty)].OreCount > 0).OrderBy(b => b.X + b.Y).ToArray();
 
         if(botsEnrouteToOre.Length > 0)
         {
@@ -1180,6 +1287,11 @@ public class BotOverSeer
         // }
         // Console.Error.WriteLine();
 
+        //foreach(KeyValuePair<(int X, int Y), RadarAssignment> kvp in this.RadarAssignments)
+        //{
+        //    Console.Error.WriteLine($"({kvp.Key.X},{kvp.Key.Y}) assigned to Bot {kvp.Value.BotId}");
+        //}
+
 
         //int printCount = 0;
         //(int x, int y) priorKey = (-1, -1);
@@ -1307,7 +1419,7 @@ public class BotOverSeer
     }
     public bool ShouldWaitForRadar(Bot bot)
     {
-        if(!this.Bots.Values.Any(bot => bot.State == BotState.RADAR_RETRIEVE) && this.RadarAssignments.Count() < 9 && this.IdentifiedOreLow)
+        if(!this.Bots.Values.Any(bot => bot.State == BotState.RADAR_RETRIEVE) && this.RadarAssignments.Count() < 8 && this.IdentifiedOreLow && this.RadarCoolDown < 4)
         {
             (Bot nextClosestBot, int turnCount) = this.TurnCountToNextBotDeposit(false, new[] { bot });
 
@@ -1326,13 +1438,7 @@ public class BotOverSeer
         {
             if(!botsToExclude.Contains(bot))
             {
-                int turnCountForThisBot = bot.State switch
-                {
-                    BotState.DEPOSITING => ReturnTime(bot),
-                    BotState.DIGGING => ReturnTime(bot) + DigTime(bot),
-                    BotState.FETCHING => ReturnTime(bot) + DigTime(bot) + FetchTime(bot),
-                    _ => 100
-                };
+                int turnCountForThisBot = this.TimeToReturnToBase(bot);
 
                 if(minTurnCount > turnCountForThisBot && (turnCountForThisBot != 0 || !includeZeroCost))
                 {
@@ -1344,7 +1450,19 @@ public class BotOverSeer
 
         return (nextClosestBot ?? botsToExclude.FirstOrDefault(), minTurnCount);
 
-        int ReturnTime(Bot bot) => bot.X == 0 ? 0 : (bot.X / 3) + 1;
+       
+    }
+
+    private int TimeToReturnToBase(Bot bot) {
+        return bot.State switch
+        {
+            BotState.DEPOSITING => ReturnTime(bot),
+            BotState.DIGGING => ReturnTime(bot) + DigTime(bot),
+            BotState.FETCHING => ReturnTime(bot) + DigTime(bot) + FetchTime(bot),
+            _ => 100
+        };
+
+        int ReturnTime(Bot bot) => bot.X == 0 ? 0 : (bot.X / 4);
         int DigTime(Bot bot) => 1;
         int FetchTime(Bot bot) => Utility.GetOrthoDistanceTurnCost(bot.X, bot.Y, bot.Tx, bot.Ty);
     }
@@ -1353,8 +1471,8 @@ public class BotOverSeer
     {
         return  this.IdentifiedOreLow
             && !this.Bots.Values.Any(bot => bot.State == BotState.RADAR_RETRIEVE)
-            && (this.RadarAssignments.Count <= 4 && (this.TurnCountToNextBotDeposit().turnCount > this.RadarCoolDown - 2))
-            && !this.BaseRadarNeedsMet;
+            && (this.RadarAssignments.Count <= 4 && (this.TurnCountToNextBotDeposit().turnCount > this.RadarCoolDown))
+            && this.RadarAssignments.Count < 9;
     }
     private bool HandleRadarOverride()
     {
@@ -1367,7 +1485,7 @@ public class BotOverSeer
         }
 
         // First pass check for bots that are not fetching
-        foreach(Bot bot in this.GetBotsPerformingLowValueWork().OrderBy((bot) => bot.X))
+        foreach(Bot bot in this.GetBotsPerformingLowValueWork().OrderBy(bot => Math.Abs(this.TimeToReturnToBase(bot) - this.RadarCoolDown)).ThenBy((bot) => bot.X))
         {
             if(bot.OverrideBotState(BotState.RADAR_RETRIEVE))
             {
@@ -1378,7 +1496,7 @@ public class BotOverSeer
         int closestBot = -1;
         int closestBotDistanceToHq = int.MaxValue;
 
-        foreach(Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR && bot.State != BotState.DEAD))
+        foreach(Bot bot in this.Bots.Values.Where(bot => bot.ItemType != ItemType.TRAP && bot.ItemType != ItemType.RADAR && bot.State != BotState.DEAD).OrderBy(bot => Math.Abs(this.TimeToReturnToBase(bot) - this.RadarCoolDown)))
         {
             int currentBotDistanceToHq = bot.X;
             if(currentBotDistanceToHq < closestBotDistanceToHq)
@@ -1505,11 +1623,14 @@ public class BotOverSeer
         //    Console.Error.WriteLine($"Final Count for Sack at ({bombKey.X},{bombKey.Y}) is Allied: {alliedBotsInZone.Count} | Enemy: {enemyBotsInZone.Count}");
         //}
 
-        if(alliedBotsInZone.Count > 0 && enemyBotsInZone.Count - alliedBotsInZone.Count > 1)
+        if(alliedBotsInZone.Count > 0 && enemyBotsInZone.Count > 0 && enemyBotsInZone.Count - alliedBotsInZone.Count > 0)
         {
-            foreach(var bot in alliedBotsInZone)
+            foreach(int botId in alliedBotsInZone) return this.Bots[botId];
+        }
 
-                return this.Bots[alliedBotsInZone.FirstOrDefault()];
+        if(alliedBotsInZone.Count > 0 && enemyBotsInZone.Count > 0 && this.MyScore >= this.OpponentScore && enemyBotsInZone.Count - alliedBotsInZone.Count >= 0)
+        {
+            foreach(int botId in alliedBotsInZone) if(this.Bots[botId].ItemType != ItemType.RADAR) return this.Bots[botId];
         }
 
         return null;
@@ -1532,6 +1653,10 @@ public class BotOverSeer
 
     public void HandleDispatchReportOre(int x, int y, OreStruct oreReport, OreDispatchReport dispatchReport)
     {
+        if(dispatchReport == OreDispatchReport.ORE_FOUND || dispatchReport == OreDispatchReport.ORE_FOUND_WAS_STALL )
+        {
+            this.OreWasEverPresent.Add((x, y));
+        }
         if(this.OreData.TryGetValue((x, y), out OreStruct oreCurrent) && oreCurrent.HasBeenIdentified && dispatchReport != OreDispatchReport.ORE_FOUND_WAS_STALL)
         {
             // We don't do anything, because identified ore comes from radars and data will be accurately maintained without blind management.
@@ -1659,7 +1784,7 @@ public class Bot
             return (BotState.RADAR_RETRIEVE, BotSubState.UNUSED);
         }
 
-        if(this.X == 0 && !this.OverSeer.NeedRadarOverride() && this.OverSeer.RadarCoolDown == 0 && !this.OverSeer.Bots.Values.Any(b => b.State == BotState.RADAR_RETRIEVE))
+        if(this.X == 0 && !this.OverSeer.NeedRadarOverride() && this.OverSeer.Bots.Values.Where(b => b.State != BotState.DEAD).Count() == 5 && this.OverSeer.RadarCoolDown == 0 && !this.OverSeer.Bots.Values.Any(b => b.State == BotState.RADAR_RETRIEVE))
         {
             this.OverSeer.RadarCoolDown = 100;
             (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId, true);
@@ -1671,14 +1796,25 @@ public class Bot
         {
             return (BotState.DIGGING, BotSubState.DIG_SHOULD_BE_OVER);
         }
-        return (BotState.FETCHING, (this.X == 0 && (this.OverSeer.TurnCount < 2 || (this.OverSeer.OreData[(this.Tx, this.Ty)].OreCount > 1 && this.OverSeer.TurnCount < 65))) ? BotSubState.STALL : BotSubState.UNUSED);
+        return (BotState.FETCHING, 
+            this.X == 0 && (this.OverSeer.TurnCount < 2 
+                         || (this.OverSeer.OreData[(this.Tx, this.Ty)].OreCount > 1 
+                         &&  this.OverSeer.TurnCount < 65 
+                         && this.OverSeer.Bots.Values.Where(b => b.State != BotState.DEAD).Count() == 5)) 
+                            ? BotSubState.STALL 
+                            : BotSubState.UNUSED);
     }
 
     private (BotState, BotSubState) ProcessFetchingState()
     {
-        if(this.OverSeer.OreData.TryGetValue((this.X, this.Y), out OreStruct ore) && ore.HasBeenIdentified && ore.OreCount == 0)
+        if(this.OverSeer.OreData.TryGetValue((this.Tx, this.Ty), out OreStruct ore) && ore.HasBeenIdentified && ore.OreCount == 0)
         {
-            (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId);
+            int currentTx = this.Tx;
+            int currentTy = this.Ty;
+            while(this.Tx == currentTx && this.Ty == currentTy)
+            {
+                (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId);
+            }
         }
 
         if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) <= 1)
@@ -1725,6 +1861,28 @@ public class Bot
                 return this.EnterTrappingState();
             }
             return this.ProcessIdleState();
+        }
+        else if(this.X < 4)
+        {
+            (this.Tx, this.Ty) = this.OverSeer.GetOreAssignment(this.EntityId, true, false);
+            int orthoTurnCost = Utility.GetOrthoDistanceTurnCost(0, this.Y, this.Tx, this.Ty);
+
+            int availableDeviation = (4 - this.X);
+
+            int maxDeviationY = Math.Abs(this.Ty - this.Y) <= availableDeviation 
+                    ? this.Ty
+                    : this.Ty >= this.Y 
+                        ? this.Y + availableDeviation 
+                        : this.Y - availableDeviation;
+
+            int orthoTurnWithDeviation = Utility.GetOrthoDistanceTurnCost(0, maxDeviationY, this.Tx, this.Ty);
+
+            if(orthoTurnWithDeviation < orthoTurnCost)
+            {
+                Console.Error.WriteLine($"Bot {this.EntityId} deviating from (0,{this.Y}) to (0,{maxDeviationY})");
+                this.Ty = maxDeviationY;
+                return (BotState.DEPOSITING, BotSubState.DEPOSITING_OPTIMIZED_MOVE);
+            }
         }
 
         return (BotState.DEPOSITING, BotSubState.UNUSED);
@@ -1923,15 +2081,23 @@ public class Bot
 
         int destX = this.Tx;
         int destY = this.Ty;
-
-        if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty) == 5)
+        int distanceToOre = Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty);
+        if(distanceToOre == 5)
         {
             if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx-1, this.Ty) == 4) destX--;
             else if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty-1) == 4) destY--;
             else if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx, this.Ty+1) == 4) destY++;
             else if(Utility.GetOrthoDistance(this.X, this.Y, this.Tx + 1, this.Ty) == 4) destX++;
         }
-
+        else if (distanceToOre < 5)
+        {
+            int orthoTurnCost = Utility.GetOrthoDistanceTurnCost(0, this.Ty, this.Tx, this.Ty);
+            int orthoAltTurnCost = Utility.GetOrthoDistanceTurnCost(0, this.Ty, this.Tx-1, this.Ty);
+            if(orthoAltTurnCost < orthoTurnCost)
+            {
+                destX--;
+            }
+        }
 
         return this.BuildMove(this.X, this.Y, destX, destY);
     }
@@ -1944,6 +2110,11 @@ public class Bot
         if(this.X == 0)
         {
             this.BuildWait();
+        }
+
+        if(this.SubState == BotSubState.DEPOSITING_OPTIMIZED_MOVE)
+        {
+            return this.BuildMove(this.X, this.Y, 0, this.Ty);
         }
 
         return this.BuildMove(this.X, this.Y, 0, this.Y);
@@ -2028,13 +2199,13 @@ public static class Utility
 
     public static int GetOrthoDistance((int x, int y) j, (int tx, int ty) k) => Math.Abs(k.tx - j.x) + Math.Abs(k.ty - j.y);
 
-    public static int GetOrthoDistanceTurnCost(int x, int y, int tx, int ty) => 1 + Utility.GetOrthoDistance(x, y, tx, ty) / 3;
+    public static int GetOrthoDistanceTurnCost(int x, int y, int tx, int ty) => 1 + Utility.GetOrthoDistance(x, y, tx, ty) / 4;
 
-    public static int GetOrthoDistanceTurnCost(int x, int y, (int tx, int ty) k) => 1 + Utility.GetOrthoDistance(x, y, k.tx, k.ty) / 3;
+    public static int GetOrthoDistanceTurnCost(int x, int y, (int tx, int ty) k) => 1 + Utility.GetOrthoDistance(x, y, k.tx, k.ty) / 4;
 
-    public static int GetOrthoDistanceTurnCost((int x, int y) j, int tx, int ty) => 1 + Utility.GetOrthoDistance(j.x, j.y, tx, ty) / 3;
+    public static int GetOrthoDistanceTurnCost((int x, int y) j, int tx, int ty) => 1 + Utility.GetOrthoDistance(j.x, j.y, tx, ty) / 4;
 
-    public static int GetOrthoDistanceTurnCost((int x, int y) j, (int tx, int ty) k) => 1 + Utility.GetOrthoDistance(j.x, j.y, k.tx, k.ty) / 3;
+    public static int GetOrthoDistanceTurnCost((int x, int y) j, (int tx, int ty) k) => 1 + Utility.GetOrthoDistance(j.x, j.y, k.tx, k.ty) / 4;
     #region Command Building
     public static string BuildWait(this Bot bot)
     {
@@ -2195,7 +2366,8 @@ public enum BotSubState
     RADAR_ASSIST,
     WAS_A_STALL,
     WAS_A_STALL_DIG_SHOULD_BE_OVER,
-    SHOULD_BE_DEAD
+    SHOULD_BE_DEAD,
+    DEPOSITING_OPTIMIZED_MOVE
 }
 
 public enum EntityType
